@@ -55,7 +55,7 @@ EventDispatcher::~EventDispatcher() {
     }
 }
 
-int EventDispatcher::Start(const bthread_attr_t* consumer_thread_attr) {
+int EventDispatcher::Start(const bthread_attr_t* thread_attr) {
     if (_event_dispatcher_fd < 0) {
         LOG(FATAL) << "epoll was not created";
         return -1;
@@ -69,12 +69,16 @@ int EventDispatcher::Start(const bthread_attr_t* consumer_thread_attr) {
 
     // Set _thread_attr before creating epoll thread to make sure
     // everyting seems sane to the thread.
-    _thread_attr = consumer_thread_attr  ?
-        *consumer_thread_attr : BTHREAD_ATTR_NORMAL;
+    if (thread_attr) {
+        _thread_attr = *thread_attr;
+    }
 
     //_thread_attr is used in StartInputEvent(), assign flag NEVER_QUIT to it will cause new bthread
     // that created by epoll_wait() never to quit.
-    bthread_attr_t epoll_thread_attr = _thread_attr | BTHREAD_NEVER_QUIT;
+    // Only event dispatcher thread has flag BTHREAD_GLOBAL_PRIORITY.
+    bthread_attr_t epoll_thread_attr =
+        _thread_attr | BTHREAD_NEVER_QUIT | BTHREAD_GLOBAL_PRIORITY;
+    bthread_attr_set_name(&epoll_thread_attr, "EventDispatcher::RunThis");
 
     // Polling thread uses the same attr for consumer threads (NORMAL right
     // now). Previously, we used small stack (32KB) which may be overflowed
@@ -222,14 +226,18 @@ void EventDispatcher::Run() {
                 || (e[i].events & has_epollrdhup)
 #endif
                 ) {
+                int64_t start_ns = butil::cpuwide_time_ns();
                 // We don't care about the return value.
                 CallInputEventCallback(e[i].data.u64, e[i].events, _thread_attr);
+                (*g_edisp_read_lantency) << (butil::cpuwide_time_ns() - start_ns);
             }
         }
         for (int i = 0; i < n; ++i) {
             if (e[i].events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                int64_t start_ns = butil::cpuwide_time_ns();
                 // We don't care about the return value.
                 CallOutputEventCallback(e[i].data.u64, e[i].events, _thread_attr);
+                (*g_edisp_write_lantency) << (butil::cpuwide_time_ns() - start_ns);
             }
         }
     }

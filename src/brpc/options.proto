@@ -64,6 +64,7 @@ enum ProtocolType {
     PROTOCOL_CDS_AGENT = 24;           // Client side only
     PROTOCOL_ESP = 25;                 // Client side only
     PROTOCOL_H2 = 26;
+    PROTOCOL_COUCHBASE = 27;
 }
 
 enum CompressType {
@@ -72,6 +73,18 @@ enum CompressType {
     COMPRESS_TYPE_GZIP = 2;
     COMPRESS_TYPE_ZLIB = 3;
     COMPRESS_TYPE_LZ4 = 4;
+}
+
+enum ChecksumType {
+    CHECKSUM_TYPE_NONE = 0;
+    CHECKSUM_TYPE_CRC32C = 1;
+}
+
+enum ContentType {
+    CONTENT_TYPE_PB = 0;
+    CONTENT_TYPE_JSON = 1;
+    CONTENT_TYPE_PROTO_JSON = 2;
+    CONTENT_TYPE_PROTO_TEXT = 3;
 }
 
 message ChunkInfo {

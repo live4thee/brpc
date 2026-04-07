@@ -183,8 +183,8 @@ static void CreateIgnoreAllRead() { s_ignore_all_read = new IgnoreAllRead; }
 // you don't have to set the fields to initial state after deletion since
 // they'll be set uniformly after this method is called.
 void Controller::ResetNonPods() {
-    if (_span) {
-        Span::Submit(_span, butil::cpuwide_time_us());
+    if (auto span = _span.lock()) {
+        Span::Submit(span, butil::cpuwide_time_us());
     }
     _error_text.clear();
     _remote_side = butil::EndPoint();
@@ -240,7 +240,7 @@ void Controller::ResetNonPods() {
 void Controller::ResetPods() {
     // NOTE: Make the sequence of assignments same with the order that they're
     // defined in header. Better for cpu cache and faster for lookup.
-    _span = NULL;
+    _span.reset();
     _flags = 0;
 #ifndef BAIDU_INTERNAL
     set_pb_bytes_to_base64(true);
@@ -258,6 +258,7 @@ void Controller::ResetPods() {
     _connection_type = CONNECTION_TYPE_UNKNOWN;
     _timeout_ms = UNSET_MAGIC_NUM;
     _backup_request_ms = UNSET_MAGIC_NUM;
+    _backup_request_policy = NULL;
     _connect_timeout_ms = UNSET_MAGIC_NUM;
     _real_timeout_ms = UNSET_MAGIC_NUM;
     _deadline_us = -1;
@@ -268,6 +269,8 @@ void Controller::ResetPods() {
     _preferred_index = -1;
     _request_compress_type = COMPRESS_TYPE_NONE;
     _response_compress_type = COMPRESS_TYPE_NONE;
+    _request_checksum_type = CHECKSUM_TYPE_NONE;
+    _response_checksum_type = CHECKSUM_TYPE_NONE;
     _fail_limit = UNSET_MAGIC_NUM;
     _pipelined_count = 0;
     _inheritable.Reset();
@@ -289,10 +292,13 @@ void Controller::ResetPods() {
     _http_response = NULL;
     _request_user_fields = NULL;
     _response_user_fields = NULL;
-    _request_stream = INVALID_STREAM_ID;
-    _response_stream = INVALID_STREAM_ID;
+    _request_content_type = CONTENT_TYPE_PB;
+    _response_content_type = CONTENT_TYPE_PB;
+    _request_streams.clear();
+    _response_streams.clear();
     _remote_stream_settings = NULL;
     _auth_flags = 0;
+    _rpc_received_us = 0;
 }
 
 Controller::Call::Call(Controller::Call* rhs)
@@ -342,6 +348,24 @@ void Controller::set_backup_request_ms(int64_t timeout_ms) {
         _backup_request_ms = 0x7fffffff;
         LOG(WARNING) << "backup_request_ms is limited to 0x7fffffff (roughly 24 days)";
     }
+}
+
+int64_t Controller::backup_request_ms() const {
+    int timeout_ms = _backup_request_ms;
+    if (NULL != _backup_request_policy) {
+        const int32_t policy_ms = _backup_request_policy->GetBackupRequestMs(this);
+        // -1 is the designated sentinel: the policy defers to the channel-level
+        // backup_request_ms (set from ChannelOptions). Any other negative value
+        // disables backup for this RPC. Values >= 0 override directly.
+        if (policy_ms != -1) {
+            timeout_ms = policy_ms;
+        }
+    }
+    if (timeout_ms > 0x7fffffff) {
+        timeout_ms = 0x7fffffff;
+        LOG(WARNING) << "backup_request_ms is limited to 0x7fffffff (roughly 24 days)";
+    }
+    return timeout_ms;
 }
 
 void Controller::set_max_retry(int max_retry) {
@@ -434,9 +458,9 @@ void Controller::SetFailed(const std::string& reason) {
         AppendServerIdentiy();
     }
     _error_text.append(reason);
-    if (_span) {
-        _span->set_error_code(_error_code);
-        _span->Annotate(reason);
+    if (auto span = _span.lock()) {
+        span->set_error_code(_error_code);
+        span->Annotate(reason);
     }
     UpdateResponseHeader(this);
 }
@@ -463,9 +487,9 @@ void Controller::SetFailed(int error_code, const char* reason_fmt, ...) {
     va_start(ap, reason_fmt);
     butil::string_vappendf(&_error_text, reason_fmt, ap);
     va_end(ap);
-    if (_span) {
-        _span->set_error_code(_error_code);
-        _span->AnnotateCStr(_error_text.c_str() + old_size, 0);
+    if (auto span = _span.lock()) {
+        span->set_error_code(_error_code);
+        span->AnnotateCStr(_error_text.c_str() + old_size, 0);
     }
     UpdateResponseHeader(this);
 }
@@ -491,9 +515,9 @@ void Controller::CloseConnection(const char* reason_fmt, ...) {
     va_start(ap, reason_fmt);
     butil::string_vappendf(&_error_text, reason_fmt, ap);
     va_end(ap);
-    if (_span) {
-        _span->set_error_code(_error_code);
-        _span->AnnotateCStr(_error_text.c_str() + old_size, 0);
+    if (auto span = _span.lock()) {
+        span->set_error_code(_error_code);
+        span->AnnotateCStr(_error_text.c_str() + old_size, 0);
     }
     UpdateResponseHeader(this);
 }
@@ -606,6 +630,13 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
         goto END_OF_RPC;
     }
     if (_error_code == EBACKUPREQUEST) {
+        if (NULL != _backup_request_policy && !_backup_request_policy->DoBackup(this)) {
+            // No need to do backup request.
+            _error_code = saved_error;
+            CHECK_EQ(0, bthread_id_unlock(info.id));
+            return;
+        }
+
         // Reset timeout if needed
         int rc = 0;
         if (timeout_ms() >= 0) {
@@ -720,6 +751,7 @@ END_OF_RPC:
         bthread_t bt;
         bthread_attr_t attr = (FLAGS_usercode_in_pthread ?
                                BTHREAD_ATTR_PTHREAD : BTHREAD_ATTR_NORMAL);
+        bthread_attr_set_name(&attr, "RunEndRPC");
         _tmp_completion_info = info;
         if (bthread_start_background(&bt, &attr, RunEndRPC, this) != 0) {
             LOG(FATAL) << "Fail to start bthread";
@@ -838,7 +870,7 @@ void Controller::Call::OnComplete(
         }
     }
 
-    if (need_feedback) {
+    if (need_feedback && c->_lb) {
         const LoadBalancer::CallInfo info =
             { begin_time_us, peer_id, error_code, c };
         c->_lb->Feedback(info);
@@ -920,9 +952,9 @@ void Controller::EndRPC(const CompletionInfo& info) {
     }
     // RPC finished, now it's safe to release `LoadBalancerWithNaming'
     _lb.reset();
-    if (_span) {
-        _span->set_ending_cid(info.id);
-        _span->set_async(_done);
+    if (auto span = _span.lock()) {
+        span->set_ending_cid(info.id);
+        span->set_async(_done);
         // Submit the span if we're in async RPC. For sync RPC, the span
         // is submitted after Join() to get a more accurate resuming timestamp.
         if (_done) {
@@ -969,6 +1001,14 @@ void Controller::EndRPC(const CompletionInfo& info) {
         CHECK_EQ(0, bthread_id_unlock_and_destroy(saved_cid));
     }
 }
+
+void Controller::OnRPCEnd(int64_t end_time_us) {
+    _end_time_us = end_time_us;
+    if (NULL != _backup_request_policy) {
+        _backup_request_policy->OnRPCEnd(this);
+    }
+}
+
 void Controller::RunDoneInBackupThread(void* arg) {
     static_cast<Controller*>(arg)->DoneInBackupThread();
 }
@@ -988,12 +1028,16 @@ void Controller::DoneInBackupThread() {
 
 void Controller::SubmitSpan() {
     const int64_t now = butil::cpuwide_time_us();
-    _span->set_start_callback_us(now);
-    if (_span->local_parent()) {
-        _span->local_parent()->AsParent();
+    if (auto span = _span.lock()) {
+        span->set_start_callback_us(now);
+        if (auto parent_span = span->local_parent().lock()) {
+            if (parent_span->is_active()) {
+                parent_span->AsParent();
+            }
+        }
+        Span::Submit(span, now);
+        _span.reset();
     }
-    Span::Submit(_span, now);
-    _span = NULL;
 }
 
 void Controller::HandleSendFailed() {
@@ -1091,8 +1135,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         CHECK_EQ(_remote_side, tmp_sock->remote_side());
     }
 
-    Span* span = _span;
-    if (span) {
+    if (auto span = _span.lock()) {
         if (_current_call.nretry == 0) {
             span->set_remote_side(_remote_side);
         } else {
@@ -1204,7 +1247,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     int rc;
     size_t packet_size = 0;
     if (user_packet_guard) {
-        if (span) {
+        if (auto span = _span.lock()) {
             packet_size = user_packet_guard->EstimatedByteSize();
         }
         rc = _current_call.sending_sock->Write(user_packet_guard, &wopt);
@@ -1212,7 +1255,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         packet_size = packet.size();
         rc = _current_call.sending_sock->Write(&packet, &wopt);
     }
-    if (span) {
+    if (auto span = _span.lock()) {
         if (_current_call.nretry == 0) {
             span->set_sent_us(butil::cpuwide_time_us());
             span->set_request_size(packet_size);
@@ -1313,10 +1356,12 @@ CallId Controller::call_id() {
 void Controller::SaveClientSettings(ClientSettings* s) const {
     s->timeout_ms = _timeout_ms;
     s->backup_request_ms = _backup_request_ms;
+    s->backup_request_policy = _backup_request_policy;
     s->max_retry = _max_retry;
     s->tos = _tos;
     s->connection_type = _connection_type;
     s->request_compress_type = _request_compress_type;
+    s->request_checksum_type = _request_checksum_type;
     s->log_id = log_id();
     s->has_request_code = has_request_code();
     s->request_code = _request_code;
@@ -1325,10 +1370,12 @@ void Controller::SaveClientSettings(ClientSettings* s) const {
 void Controller::ApplyClientSettings(const ClientSettings& s) {
     set_timeout_ms(s.timeout_ms);
     set_backup_request_ms(s.backup_request_ms);
+    set_backup_request_policy(s.backup_request_policy);
     set_max_retry(s.max_retry);
     set_type_of_service(s.tos);
     set_connection_type(s.connection_type);
     set_request_compress_type(s.request_compress_type);
+    set_request_checksum_type(s.request_checksum_type);
     set_log_id(s.log_id);
     set_flag(FLAGS_REQUEST_CODE, s.has_request_code);
     _request_code = s.request_code;
@@ -1352,8 +1399,19 @@ const Controller* Controller::sub(int index) const {
     return NULL;
 }
 
-uint64_t Controller::trace_id() const { return _span ? _span->trace_id() : 0; }
-uint64_t Controller::span_id() const { return _span ? _span->span_id() : 0; }
+uint64_t Controller::trace_id() const {
+    if (auto span = _span.lock()) {
+        return span->trace_id();
+    }
+    return 0;
+}
+
+uint64_t Controller::span_id() const {
+    if (auto span = _span.lock()) {
+        return span->span_id();
+    }
+    return 0;
+}
 
 void* Controller::session_local_data() {
     if (_session_local_data) {
@@ -1370,34 +1428,55 @@ void* Controller::session_local_data() {
 }
 
 void Controller::HandleStreamConnection(Socket *host_socket) {
-    if (_request_stream == INVALID_STREAM_ID) {
+    if (_request_streams.empty()) {
         CHECK(!has_remote_stream());
         return;
     }
-    SocketUniquePtr ptr;
+    size_t stream_num = _request_streams.size();
+    std::vector<SocketUniquePtr> ptrs(stream_num);
     if (!FailedInline()) {
-        if (Socket::Address(_request_stream, &ptr) != 0) {
-            if (!FailedInline()) {
-                SetFailed(EREQUEST, "Request stream=%" PRIu64 " was closed before responded",
-                                     _request_stream);
-            }
-        } else if (_remote_stream_settings == NULL) {
+        if (_remote_stream_settings == NULL) {
             if (!FailedInline()) {
                 SetFailed(EREQUEST, "The server didn't accept the stream");
+            }
+        } else {
+            for (size_t i = 0; i < stream_num; ++i) {
+                if (Socket::Address(_request_streams[i], &ptrs[i]) != 0) {
+                    if (!FailedInline()) {
+                        SetFailed(EREQUEST, "Request stream=%" PRIu64 " was closed before responded",
+                                  _request_streams[i]);
+                        break;
+                    }
+                }
             }
         }
     }
     if (FailedInline()) {
-        Stream::SetFailed(_request_stream, _error_code,
+        Stream::SetFailed(_request_streams, _error_code,
                           "%s", _error_text.c_str());
         if (_remote_stream_settings != NULL) {
             policy::SendStreamRst(host_socket,
                                   _remote_stream_settings->stream_id());
+            for (int i = 0; i < _remote_stream_settings->extra_stream_ids().size(); ++i) {
+                policy::SendStreamRst(host_socket,
+                                      _remote_stream_settings->extra_stream_ids()[i]);
+            }
         }
         return;
     }
-    Stream* s = (Stream*)ptr->conn();
+    Stream* s = (Stream*)ptrs[0]->conn();
     s->SetConnected(_remote_stream_settings);
+    if (stream_num > 1) {
+        auto extra_stream_ids = std::move(*_remote_stream_settings->mutable_extra_stream_ids());
+        _remote_stream_settings->clear_extra_stream_ids();
+        for (size_t i = 1; i < stream_num; ++i) {
+            if(!ptrs[i]) continue;
+            Stream* extra_stream = (Stream *) ptrs[i]->conn();
+            _remote_stream_settings->set_stream_id(extra_stream_ids[i - 1]);
+            s->SetHostSocket(host_socket);
+            extra_stream->SetConnected(_remote_stream_settings);
+        }
+    }
 }
 
 // TODO: Need more security advices from professionals.
@@ -1657,6 +1736,26 @@ void Controller::DoPrintLogPrefix(std::ostream& os) const {
     if (FLAGS_log_as_json) {
         os << "\"M\":\"";
     }
+}
+
+
+ControllerPrivateAccessor& ControllerPrivateAccessor::set_span(
+    const std::shared_ptr<Span>& span) {
+    _cntl->_span = span;
+    return *this;
+}
+
+ControllerPrivateAccessor& ControllerPrivateAccessor::set_span(Span* span) {
+    if (span) {
+        _cntl->_span = span->shared_from_this();
+    } else {
+        _cntl->_span.reset();
+    }
+    return *this;
+}
+
+std::shared_ptr<Span> ControllerPrivateAccessor::span() const {
+    return _cntl->_span.lock();
 }
 
 } // namespace brpc

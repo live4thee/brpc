@@ -20,7 +20,10 @@
 #include <google/protobuf/message.h>             // Message
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/io/coded_stream.h>
+
 #include "butil/time.h"
+#include "butil/strings/string_util.h"
+
 #include "brpc/controller.h"                // Controller
 #include "brpc/socket.h"                    // Socket
 #include "brpc/server.h"                    // Server
@@ -212,7 +215,7 @@ static void SendSofaResponse(int64_t correlation_id,
                              MethodStatus* method_status,
                              int64_t received_us) {
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
+    auto span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
@@ -281,8 +284,15 @@ static void SendSofaResponse(int64_t correlation_id,
     }
     // Have the risk of unlimited pending responses, in which case, tell
     // users to set max_concurrency.
+    ResponseWriteInfo args;
     Socket::WriteOptions wopt;
     wopt.ignore_eovercrowded = true;
+    bthread_id_t response_id = INVALID_BTHREAD_ID;
+    if (span) {
+        CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
     if (sock->Write(&res_buf, &wopt) != 0) {
         const int errcode = errno;
         PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -290,9 +300,12 @@ static void SendSofaResponse(int64_t correlation_id,
                         sock->description().c_str());
         return;
     }
+
     if (span) {
+        bthread_id_join(response_id);
+        // Do not care about the result of background writing.
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
+        span->set_sent_us(args.sent_us);
     }
 }
 
@@ -361,7 +374,7 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
         bthread_assign_data((void*)&server->thread_local_options());
     }
 
-    Span* span = NULL;
+    std::shared_ptr<Span> span;
     if (IsTraceable(false)) {
         span = Span::CreateServerSpan(
             0/*meta.trace_id()*/, 0/*meta.span_id()*/,
@@ -378,12 +391,6 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
     do {
         if (!server->IsRunning()) {
             cntl->SetFailed(ELOGOFF, "Server is stopping");
-            break;
-        }
-
-        if (socket->is_overcrowded()) {
-            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
-                            butil::endpoint2str(socket->remote_side()).c_str());
             break;
         }
 
@@ -406,6 +413,13 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
                             meta.method().c_str());
             break;
         }
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !sp->ignore_eovercrowded) {
+            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
+                            butil::endpoint2str(socket->remote_side()).c_str());
+            break;
+        }
         // Switch to service-specific error.
         non_service_error.release();
         method_status = sp->status;
@@ -413,7 +427,7 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
             int rejected_cc = 0;
             if (!method_status->OnRequested(&rejected_cc)) {
                 cntl->SetFailed(ELIMIT, "Rejected by %s's ConcurrencyLimiter, concurrency=%d",
-                                sp->method->full_name().c_str(), rejected_cc);
+                                butil::EnsureString(sp->method->full_name()).c_str(), rejected_cc);
                 break;
             }
         }
@@ -426,7 +440,7 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
         }
 
         if (span) {
-            span->ResetServerSpanName(method->full_name());
+            span->ResetServerSpanName(butil::EnsureString(method->full_name()));
         }
         req.reset(svc->GetRequestPrototype(method).New());
         if (!ParseFromCompressedData(msg->payload, req.get(), req_cmp_type)) {
@@ -503,8 +517,7 @@ void ProcessSofaResponse(InputMessageBase* msg_base) {
     }
     
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.size() + msg->payload.size() + 24);

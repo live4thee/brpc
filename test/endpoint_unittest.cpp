@@ -115,6 +115,19 @@ TEST(EndPointTest, endpoint) {
     ASSERT_EQ(289, p6.port);
 #endif
 }
+TEST(EndPointTest, endpoint_reject_trailing_characters_after_port) {
+    butil::EndPoint ep;
+
+    // invalid: non-whitespace after port
+    ASSERT_EQ(-1, butil::str2endpoint("127.0.0.1:8000a", &ep));
+    ASSERT_EQ(-1, butil::str2endpoint("127.0.0.1:8000#", &ep));
+    ASSERT_EQ(-1, butil::str2endpoint("127.0.0.1:8000abc", &ep));
+
+    // valid: only whitespace after port
+    ASSERT_EQ(0, butil::str2endpoint("127.0.0.1:8000 ", &ep));
+    ASSERT_EQ(0, butil::str2endpoint("127.0.0.1:8000\t", &ep));
+    ASSERT_EQ(0, butil::str2endpoint("127.0.0.1:8000\n", &ep));
+}
 
 TEST(EndPointTest, hash_table) {
     butil::hash_map<butil::EndPoint, int> m;
@@ -483,21 +496,23 @@ TEST(EndPointTest, endpoint_concurrency) {
     }
 }
 
-const char* g_hostname = "baidu.com";
-
+const char* g_hostname1 = "github.com";
+const char* g_hostname2 = "baidu.com";
 TEST(EndPointTest, tcp_connect) {
-    butil::EndPoint ep;
-    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname, 80, &ep));
+    butil::EndPoint ep1;
+    butil::EndPoint ep2;
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname1, 80, &ep1));
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname2, 80, &ep2));
     {
-        butil::fd_guard sockfd(butil::tcp_connect(ep, NULL));
+        butil::fd_guard sockfd(butil::tcp_connect(ep1, NULL));
         ASSERT_LE(0, sockfd) << "errno=" << errno;
     }
     {
-        butil::fd_guard sockfd(butil::tcp_connect(ep, NULL, 1000));
+        butil::fd_guard sockfd(butil::tcp_connect(ep1, NULL, 1000));
         ASSERT_LE(0, sockfd) << "errno=" << errno;
     }
     {
-        butil::fd_guard sockfd(butil::tcp_connect(ep, NULL, 1));
+        butil::fd_guard sockfd(butil::tcp_connect(ep2, NULL, 1));
         ASSERT_EQ(-1, sockfd) << "errno=" << errno;
         ASSERT_EQ(ETIMEDOUT, errno);
     }
@@ -505,7 +520,7 @@ TEST(EndPointTest, tcp_connect) {
     {
         struct sockaddr_storage serv_addr{};
         socklen_t serv_addr_size = 0;
-        ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+        ASSERT_EQ(0, endpoint2sockaddr(ep1, &serv_addr, &serv_addr_size));
         butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
         ASSERT_LE(0, sockfd);
         bool is_blocking = butil::is_blocking(sockfd);
@@ -517,7 +532,7 @@ TEST(EndPointTest, tcp_connect) {
     {
         struct sockaddr_storage serv_addr{};
         socklen_t serv_addr_size = 0;
-        ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+        ASSERT_EQ(0, endpoint2sockaddr(ep2, &serv_addr, &serv_addr_size));
         butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
         ASSERT_LE(0, sockfd);
         bool is_blocking = butil::is_blocking(sockfd);
@@ -536,7 +551,7 @@ bool g_connect_startd = false;
 
 void TestConnectInterruptImpl(bool timed) {
     butil::EndPoint ep;
-    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname, 80, &ep));
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname1, 80, &ep));
 
     struct sockaddr_storage serv_addr{};
     socklen_t serv_addr_size = 0;
@@ -551,7 +566,7 @@ void TestConnectInterruptImpl(bool timed) {
         int64_t connect_ms = butil::cpuwide_time_ms() - start_ms;
         LOG(INFO) << "Connect to " << ep << ", cost " << connect_ms << "ms";
 
-        timespec abstime = butil::milliseconds_from_now(connect_ms + 1);
+        timespec abstime = butil::milliseconds_from_now(connect_ms * 10);
         rc = butil::pthread_timed_connect(
             sockfd, (struct sockaddr*) &serv_addr,
             serv_addr_size, &abstime);
@@ -570,12 +585,10 @@ void* ConnectThread(void* arg) {
     return NULL;
 }
 
-void sig_handler(int sig) {
-    LOG(INFO) << "sig=" << sig;
-}
+void do_nothing_handler(int) {}
 
 void register_sigurg() {
-    signal(SIGURG, sig_handler);
+    signal(SIGURG, do_nothing_handler);
 }
 
 void TestConnectInterrupt(bool timed) {

@@ -22,7 +22,6 @@
 #include "bthread/execution_queue.h"
 
 #include "butil/memory/singleton_on_pthread_once.h"
-#include "butil/object_pool.h"           // butil::get_object
 #include "butil/resource_pool.h"         // butil::get_resource
 #include "butil/threading/platform_thread.h"
 
@@ -68,7 +67,7 @@ inline ExecutionQueueVars* get_execq_vars() {
 
 void ExecutionQueueBase::start_execute(TaskNode* node) {
     node->next = TaskNode::UNCONNECTED;
-    node->status = UNEXECUTED;
+    node->status = TaskNode::UNEXECUTED;
     node->iterated = false;
     if (node->high_priority) {
         // Add _high_priority_tasks before pushing this task into queue to
@@ -209,7 +208,7 @@ void* ExecutionQueueBase::_execute_tasks(void* arg) {
 }
 
 void* ExecutionQueueBase::_execute_tasks_pthread(void* arg) {
-    butil::PlatformThread::SetName("ExecutionQueue");
+    butil::PlatformThread::SetNameSimple("ExecutionQueue");
     auto head = (TaskNode*)arg;
     auto m = (ExecutionQueueBase*)head->q;
     m->_current_head = head;
@@ -304,7 +303,7 @@ int ExecutionQueueBase::_execute(TaskNode* head, bool high_priority, int* nitera
     if (head != NULL && head->stop_task) {
         CHECK(head->next == NULL);
         head->iterated = true;
-        head->status = EXECUTED;
+        head->status = TaskNode::EXECUTED;
         TaskIteratorBase iter(NULL, this, true, false);
         _execute_func(_meta, _type_specific_function, iter);
         if (niterated) {

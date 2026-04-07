@@ -21,6 +21,7 @@ licenses(["notice"])  # Apache v2
 exports_files(["LICENSE"])
 
 COPTS = [
+    "-fno-omit-frame-pointer",
     "-DBTHREAD_USE_FAST_PTHREAD_MUTEX",
     "-D__const__=__unused__",
     "-D_GNU_SOURCE",
@@ -29,7 +30,6 @@ COPTS = [
     "-D__STDC_FORMAT_MACROS",
     "-D__STDC_LIMIT_MACROS",
     "-D__STDC_CONSTANT_MACROS",
-    "-DGFLAGS_NS=google",
 ] + select({
     "//bazel/config:brpc_with_glog": ["-DBRPC_WITH_GLOG=1"],
     "//conditions:default": ["-DBRPC_WITH_GLOG=0"],
@@ -45,13 +45,25 @@ COPTS = [
 }) + select({
     "//bazel/config:brpc_with_rdma": ["-DBRPC_WITH_RDMA=1"],
     "//conditions:default": [""],
+}) + select({
+    "//bazel/config:brpc_with_debug_bthread_sche_safety": ["-DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=1"],
+    "//conditions:default": ["-DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=0"],
+}) + select({
+    "//bazel/config:brpc_with_debug_lock": ["-DBRPC_DEBUG_LOCK=1"],
+    "//conditions:default": ["-DBRPC_DEBUG_LOCK=0"],
+}) + select({
+    "//bazel/config:brpc_with_asan": ["-fsanitize=address"],
+    "//conditions:default": [""],
+}) + select({
+    "//bazel/config:brpc_with_no_pthread_mutex_hook": ["-DNO_PTHREAD_MUTEX_HOOK"],
+    "//conditions:default": [""],
 })
 
 LINKOPTS = [
     "-pthread",
     "-ldl",
 ] + select({
-    "@bazel_tools//tools/osx:darwin_x86_64": [
+    "@bazel_tools//src/conditions:darwin": [
         "-framework CoreFoundation",
         "-framework CoreGraphics",
         "-framework CoreData",
@@ -63,6 +75,8 @@ LINKOPTS = [
         "-Wl,-U,_ProfilerStop",
         "-Wl,-U,__Z13GetStackTracePPvii",
         "-Wl,-U,_RegisterThriftProtocol",
+        "-Wl,-U,_mallctl",
+        "-Wl,-U,_malloc_stats_print",
     ],
     "//conditions:default": [
         "-lrt",
@@ -77,7 +91,10 @@ LINKOPTS = [
         "-libverbs",
     ],
     "//conditions:default": [],
-})
+}) + select({
+        "//bazel/config:brpc_with_asan": ["-fsanitize=address"],
+        "//conditions:default": [""],
+  })
 
 genrule(
     name = "config_h",
@@ -213,12 +230,13 @@ BUTIL_SRCS = [
     "src/butil/crc32c.cc",
     "src/butil/containers/case_ignored_flat_map.cpp",
     "src/butil/iobuf.cpp",
+    "src/butil/single_iobuf.cpp",
     "src/butil/iobuf_profiler.cpp",
     "src/butil/binary_printer.cpp",
     "src/butil/recordio.cc",
     "src/butil/popen.cpp",
 ] + select({
-    "@bazel_tools//tools/osx:darwin_x86_64": [
+    "@bazel_tools//src/conditions:darwin": [
         "src/butil/time/time_mac.cc",
         "src/butil/mac/scoped_mach_port.cc",
     ],
@@ -333,7 +351,7 @@ cc_library(
         "//bazel/config:brpc_with_glog": ["@com_github_google_glog//:glog"],
         "//conditions:default": [],
     }) + select({
-        "@bazel_tools//tools/osx:darwin_x86_64": [":macos_lib"],
+        "@bazel_tools//src/conditions:darwin": [":macos_lib"],
         "//conditions:default": [],
     }) + select({
         "//bazel/config:brpc_with_boringssl": ["@boringssl//:ssl", "@boringssl//:crypto"],
@@ -360,6 +378,10 @@ cc_library(
         "src/bvar/utils/*.h",
         "src/bvar/detail/*.h",
     ]),
+    defines = [] + select({
+        "//bazel/config:with_babylon_counter": ["WITH_BABYLON_COUNTER=1"],
+        "//conditions:default": [],
+    }),
     copts = COPTS + select({
         "//bazel/config:brpc_build_for_unittest": [
             "-DBVAR_NOT_LINK_DEFAULT_VARIABLES",
@@ -374,7 +396,10 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":butil",
-    ],
+    ]  + select({
+        "//bazel/config:with_babylon_counter": ["@babylon//:concurrent_counter"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -386,6 +411,12 @@ cc_library(
         "src/bthread/*.h",
         "src/bthread/*.list",
     ]),
+    defines = [] + select({
+        "//bazel/config:brpc_with_bthread_tracer": [
+            "BRPC_BTHREAD_TRACER",
+        ],
+        "//conditions:default": [],
+    }),
     copts = COPTS,
     includes = [
         "src/",
@@ -395,7 +426,14 @@ cc_library(
     deps = [
         ":butil",
         ":bvar",
-    ],
+    ] + select({
+        "//bazel/config:brpc_with_bthread_tracer": [
+            "@com_github_libunwind_libunwind//:libunwind",
+            "@com_google_absl//absl/debugging:stacktrace",
+            "@com_google_absl//absl/debugging:symbolize",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -437,7 +475,7 @@ cc_library(
     deps = [
         ":brpc_idl_options_cc_proto",
         ":butil",
-        "@com_google_protobuf//:protoc_lib",
+        "@com_google_protobuf//src/google/protobuf/compiler:code_generator",
     ],
 )
 
@@ -452,6 +490,7 @@ filegroup(
 proto_library(
     name = "brpc_idl_options_proto",
     srcs = [":brpc_idl_options_proto_srcs"],
+    strip_import_prefix = "src",
     visibility = ["//visibility:public"],
     deps = [
         "@com_google_protobuf//:descriptor_proto",

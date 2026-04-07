@@ -25,7 +25,7 @@
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 #include <google/protobuf/descriptor.h>
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "brpc/socket.h"
@@ -66,9 +66,19 @@ DECLARE_bool(rpcz_hex_log_id);
 DECLARE_int32(idle_timeout_second);
 } // namespace rpc
 
+#ifdef BRPC_BTHREAD_TRACER
+namespace bthread {
+DECLARE_int32(signal_number_for_trace);
+}
+#endif
+
 int main(int argc, char* argv[]) {
     brpc::FLAGS_idle_timeout_second = 0;
     testing::InitGoogleTest(&argc, argv);
+#ifdef BRPC_BTHREAD_TRACER
+    // test using signal number other than SIGURG
+    bthread::FLAGS_signal_number_for_trace = SIGUSR2;
+#endif
     return RUN_ALL_TESTS();
 }
 
@@ -113,7 +123,7 @@ void MyVLogSite() {
 void CheckContent(const brpc::Controller& cntl, const char* name) {
     const std::string& content = cntl.response_attachment().to_string();
     std::size_t pos = content.find(name);
-    ASSERT_TRUE(pos != std::string::npos) << "name=" << name;
+    ASSERT_TRUE(pos != std::string::npos) << "name=" << name << " content=" << content;
 }
 
 void CheckErrorText(const brpc::Controller& cntl, const char* error) {
@@ -717,6 +727,7 @@ TEST_F(BuiltinServiceTest, rpcz) {
     }
 }
 
+#if defined(BRPC_ENABLE_CPU_PROFILER) || defined(BAIDU_RPC_ENABLE_CPU_PROFILER)
 TEST_F(BuiltinServiceTest, pprof) {
     brpc::PProfService service;
     {
@@ -758,6 +769,7 @@ TEST_F(BuiltinServiceTest, pprof) {
         CheckContent(cntl, "brpc_builtin_service_unittest");
     }
 }
+#endif // BRPC_ENABLE_CPU_PROFILER || BAIDU_RPC_ENABLE_CPU_PROFILER
 
 TEST_F(BuiltinServiceTest, dir) {
     brpc::DirService service;
@@ -837,6 +849,47 @@ void* dummy_bthread(void*) {
     return NULL;
 }
 
+
+#ifdef BRPC_BTHREAD_TRACER
+bool g_bthread_trace_start = false;
+bool g_bthread_trace_stop = false;
+void* bthread_trace(void*) {
+    g_bthread_trace_start = true;
+    while (!g_bthread_trace_stop) {
+        bthread_usleep(1000 * 100);
+    }
+    return NULL;
+}
+#endif // BRPC_BTHREAD_TRACER
+
+// check all living bthreads without need to specify bthread id
+bool check_all_bthreads(bthread_t expected_th, bool enable_trace) {
+    brpc::BthreadsService service;
+    brpc::BthreadsRequest req;
+    brpc::BthreadsResponse res;
+    ClosureChecker done;
+    brpc::Controller cntl;
+    std::string all_string("all");
+    if (enable_trace) {
+        all_string.append("?st=1");
+    }
+    cntl.http_request()._unresolved_path = all_string;
+    cntl.http_request().uri().SetHttpURL("/bthreads/" + all_string);
+    service.default_method(&cntl, &req, &res, &done);
+    EXPECT_FALSE(cntl.Failed());
+    const std::string& content = cntl.response_attachment().to_string();
+    std::string expected_str = butil::string_printf("bthread=%llu",
+        (unsigned long long)expected_th);
+    bool ok = content.find("stop=0") != std::string::npos &&
+        content.find(expected_str) != std::string::npos;
+    if (ok && enable_trace) {
+        ok = content.find("bthread_trace") != std::string::npos;
+    } else if (ok && !enable_trace) {
+        ok = content.find("bthread_trace") == std::string::npos;
+    }
+    return ok;
+}
+
 TEST_F(BuiltinServiceTest, bthreads) {
     brpc::BthreadsService service;
     brpc::BthreadsRequest req;
@@ -854,8 +907,16 @@ TEST_F(BuiltinServiceTest, bthreads) {
         cntl.http_request()._unresolved_path = "not_valid";
         service.default_method(&cntl, &req, &res, &done);
         EXPECT_TRUE(cntl.Failed());
-        CheckErrorText(cntl, "is not a bthread id");
+        CheckErrorText(cntl, "is not a bthread id or all");
     }    
+    {
+        ClosureChecker done;
+        brpc::Controller cntl;
+        cntl.http_request()._unresolved_path = "all";
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        CheckContent(cntl, "stop=0");
+    }
     {
         bthread_t th;
         EXPECT_EQ(0, bthread_start_background(&th, NULL, dummy_bthread, NULL));
@@ -867,7 +928,39 @@ TEST_F(BuiltinServiceTest, bthreads) {
         service.default_method(&cntl, &req, &res, &done);
         EXPECT_FALSE(cntl.Failed());
         CheckContent(cntl, "stop=0");
-    }    
+    }
+
+#ifdef BRPC_BTHREAD_TRACER
+    bool ok = false, check_all_ok = false;
+    for (int i = 0; i < 10; ++i) {
+        bthread_t th;
+        EXPECT_EQ(0, bthread_start_background(&th, NULL, bthread_trace, NULL));
+        while (!g_bthread_trace_start) {
+            bthread_usleep(1000 * 10);
+        }
+        LOG(INFO) << "start bthread = " << th;
+        ClosureChecker done;
+        brpc::Controller cntl;
+        std::string id_string;
+        butil::string_printf(&id_string, "%llu?st=1", (unsigned long long)th);
+        cntl.http_request().uri().SetHttpURL("/bthreads/" + id_string);
+        cntl.http_request()._unresolved_path = id_string;
+        service.default_method(&cntl, &req, &res, &done);
+        EXPECT_FALSE(cntl.Failed());
+        const std::string& content = cntl.response_attachment().to_string();
+        ok = content.find("stop=0") != std::string::npos &&
+             content.find("bthread_trace") != std::string::npos;
+        check_all_ok = check_all_bthreads(th, true) && check_all_bthreads(th, false);
+        g_bthread_trace_stop = true;
+        bthread_join(th, NULL);
+        // the `bthread_trace` bthread should not be queried now
+        EXPECT_TRUE(!check_all_bthreads(th, true) && !check_all_bthreads(th, false));
+        if (ok && check_all_ok) {
+            break;
+        }
+    }
+    ASSERT_TRUE(ok && check_all_ok);
+#endif // BRPC_BTHREAD_TRACER
 }
 
 TEST_F(BuiltinServiceTest, sockets) {
@@ -904,6 +997,7 @@ TEST_F(BuiltinServiceTest, sockets) {
     }    
 }
 
+#if defined(BRPC_ENABLE_CPU_PROFILER) || defined(BAIDU_RPC_ENABLE_CPU_PROFILER)
 TEST_F(BuiltinServiceTest, memory) {
     brpc::MemoryService service;
     brpc::MemoryRequest req;
@@ -921,3 +1015,4 @@ TEST_F(BuiltinServiceTest, memory) {
     CheckContent(cntl, "tcmalloc.pageheap_free_bytes");
     CheckContent(cntl, "tcmalloc.pageheap_unmapped_bytes");
 }
+#endif // BRPC_ENABLE_CPU_PROFILER || BAIDU_RPC_ENABLE_CPU_PROFILER

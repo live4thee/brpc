@@ -331,11 +331,13 @@ size_t mbvar_list_exposed(std::vector<std::string>* names) {
 
 多维度统计的实现，主要提供bvar的获取、列举等功能。
 
+为了兼容旧的用法，KeyType默认类型是std::list<std::string>。KeyType必须是（STL或者自定义）容器，value_type必须是std::string。
+
 ## constructor
 
 有三个构造函数：
 ```c++
-template <typename T>
+template <typename T, typename KeyType = std::list<std::string>>
 class MultiDimension : public MVariable {
 public:
     // 不建议使用
@@ -398,7 +400,7 @@ bvar::MultiDimension<bvar::Adder<int> > g_request_count("foo_bar", "request_coun
 
 ## stats
 ```c++
-template <typename T>
+template <typename T, typename KeyType = std::list<std::string>>
 class MultiDimension : public MVariable {
 public:
     ...
@@ -410,7 +412,22 @@ public:
 ```
 
 ### get_stats
-根据指定label获取对应的单维度统计项bvar
+
+根据指定label获取对应的单维度统计项bvar。
+
+get_stats除了支持（默认）std::list<std::string>参数类型，也支持自定义参数类型，满足以下条件：
+1. （STL或者自定义）容器。
+2. K::value_type支持通过operator std::string()转换为std::string和通过operator butil::StringPiece()转换为butil::StringPiece。
+3. K::value_type支持和std::string进行比较。
+
+推荐使用不需要分配内存的容器（例如，std::array、absl::InlinedVector）和不需要拷贝字符串的数据结构（例如，const char*、std::string_view、butil::StringPieces），可以提高性能。
+
+bvar::MultiDimension的模板参数Shared，默认为false：
+1. 如果Shared等于false，get_stats返回模板参数T的指针，例如bvar::Adder<int>*。
+2. 如果Shared等于true，get_stats返回模板参数T的shared_ptr，例如std::shared_ptr\<bvar::Adder<int>\>。
+
+**注意**：因为shared_ptr的开销，Shared等于true的性能会比Shared等于false的性能差一些。
+
 ```c++
 #include <bvar/bvar.h>
 #include <bvar/multi_dimension.h>
@@ -420,7 +437,8 @@ namespace bar {
 // 定义一个全局的多维度mbvar变量
 bvar::MultiDimension<bvar::Adder<int> > g_request_count("request_count", {"idc", "method", "status"});
 
-int get_request_count(const std::list<std::string>& request_label) {
+template <typename K>
+int get_request_count(const K& request_label) {
     // 获取request_label对应的单维度bvar指针，比如：request_label = {"tc", "get", "200"}
     bvar::Adder<int> *request_adder = g_request_count.get_stats(request_label);
     // 判断指针非空
@@ -432,6 +450,70 @@ int get_request_count(const std::list<std::string>& request_label) {
     *request_adder << 1;
     return request_adder->get_value();
 }
+
+std::list<std::string> request_label_list = {"tc", "get", "200"};
+int request_count = get_request_count(request_label_list);
+
+std::vector<std::string_view> request_label_list = {"tc", "get", "200"};
+int request_count = get_request_count(request_label_list);
+
+std::vector<butil::StringPiece> request_label_list = {"tc", "get", "200"};
+int request_count = get_request_count(request_label_list);
+
+class MyStringView {
+public:
+    MyStringView() : _ptr(NULL), _len(0) {}
+    MyStringView(const char* str)
+        : _ptr(str),
+          _len(str == NULL ? 0 : strlen(str)) {}
+#if __cplusplus >= 201703L
+    MyStringView(const std::string_view& str)
+        : _ptr(str.data()), _len(str.size()) {}
+#endif // __cplusplus >= 201703L
+    MyStringView(const std::string& str)
+        : _ptr(str.data()), _len(str.size()) {}
+    MyStringView(const char* offset, size_t len)
+        : _ptr(offset), _len(len) {}
+
+    const char* data() const { return _ptr; }
+    size_t size() const { return _len; }
+
+    // Converts to `std::basic_string`.
+    explicit operator std::string() const {
+        if (NULL == _ptr) {
+            return {};
+        }
+        return {_ptr, size()};
+    }
+
+    // Converts to butil::StringPiece.
+    explicit operator butil::StringPiece() const {
+        if (NULL == _ptr) {
+            return {};
+        }
+        return {_ptr, size()};
+    }
+
+private:
+    const char* _ptr;
+    size_t _len;
+};
+
+bool operator==(const MyStringView& x, const std::string& y) {
+    if (x.size() != y.size()) {
+        return false;
+    }
+    return butil::StringPiece::wordmemcmp(x.data(), y.data(), x.size()) == 0;
+}
+bool operator==(const std::string& x, const MyStringView& y) {
+    if (x.size() != y.size()) {
+        return false;
+    }
+    return butil::StringPiece::wordmemcmp(x.data(), y.data(), x.size()) == 0;
+}
+
+std::vector<MyStringView> request_label_list = {"tc", "get", "200"};
+int request_count = get_request_count(request_label_list);
 
 } // namespace bar
 } // namespace foo
@@ -448,6 +530,20 @@ int get_request_count(const std::list<std::string>& request_label) {
     * store(bvar)
     * return bvar
 
+### delete_stats
+
+根据指定label删除对应的单维度统计项bvar。
+
+bvar::MultiDimension的模板参数Shared，默认为false：
+1. 如果Shared等于false，get_stats返回的是模板参数T的指针，delete_stats无法保证没有使用者，所以无法安全删除bvar。
+2. 如果Shared等于true，get_stats返回的是模板参数T的shared_ptr，delete_stats可以安全删除bvar。
+
+### clear_stats
+
+清理所有单维度统计项bvar。
+
+安全性同样受bvar::MultiDimension的模板参数Shared的影响，见delete_stats一节说明。
+
 **bvar的生命周期**
 
 label对应的单维度统计项bvar存储在多维度统计项(mbvar)中，当mbvar析构的时候会释放自身所有bvar，所以用户必须保证在mbvar的生命周期之内操作bvar，在mbvar生命周期外访问bvar的行为未定义，极有可能出core。
@@ -462,7 +558,7 @@ public:
     size_t count_labels() const;
 };
 
-template <typename T>
+template <typename T, typename KeyType = std::list<std::string>>
 class MultiDimension : public MVariable {
 public:
     ...
@@ -536,7 +632,7 @@ size_t count_stats() {
 
 ## list
 ```c++
-template <typename T>
+template <typename T, typename KeyType = std::list<std::string>>
 class MultiDimension : public MVariable {
 public:
     ...

@@ -46,6 +46,13 @@ DEFINE_int32(defer_close_second, 0,
              "non-positive values.");
 BRPC_VALIDATE_GFLAG(defer_close_second, PassValidate);
 
+DEFINE_bool(defer_close_respect_idle, false,
+            "When defer_close_second > 0, close a connection immediately when "
+            "the last reference is removed and the socket has already been "
+            "idle for longer than defer_close_second. Disabled by default for "
+            "backward compatibility.");
+BRPC_VALIDATE_GFLAG(defer_close_respect_idle, PassValidate);
+
 DEFINE_bool(show_socketmap_in_vars, false,
             "[DEBUG] Describe SocketMaps in /vars");
 BRPC_VALIDATE_GFLAG(show_socketmap_in_vars, PassValidate);
@@ -71,6 +78,7 @@ static void CreateClientSideSocketMap() {
     options.socket_creator = new GlobalSocketCreator;
     options.idle_timeout_second_dynamic = &FLAGS_idle_timeout_second;
     options.defer_close_second_dynamic = &FLAGS_defer_close_second;
+    options.defer_close_respect_idle_dynamic = &FLAGS_defer_close_respect_idle;
     if (socket_map->Init(options) != 0) {
         LOG(FATAL) << "Fail to init SocketMap";
         exit(1);
@@ -90,10 +98,9 @@ SocketMap* get_or_new_client_side_socket_map() {
 }
 
 int SocketMapInsert(const SocketMapKey& key, SocketId* id,
-                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
-                    bool use_rdma) {
-    return get_or_new_client_side_socket_map()->Insert(key, id, ssl_ctx, use_rdma);
-}    
+                    SocketOptions& opt) {
+    return get_or_new_client_side_socket_map()->Insert(key, id, opt);
+}
 
 int SocketMapFind(const SocketMapKey& key, SocketId* id) {
     SocketMap* m = get_client_side_socket_map();
@@ -131,7 +138,8 @@ SocketMapOptions::SocketMapOptions()
     , idle_timeout_second_dynamic(NULL)
     , idle_timeout_second(0)
     , defer_close_second_dynamic(NULL)
-    , defer_close_second(0) {
+    , defer_close_second(0)
+    , defer_close_respect_idle_dynamic(NULL) {
 }
 
 SocketMap::SocketMap()
@@ -189,7 +197,9 @@ int SocketMap::Init(const SocketMapOptions& options) {
     }
     if (_options.idle_timeout_second_dynamic != NULL ||
         _options.idle_timeout_second > 0) {
-        if (bthread_start_background(&_close_idle_thread, NULL,
+        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+        bthread_attr_set_name(&attr, "RunWatchConnections");
+        if (bthread_start_background(&_close_idle_thread, &attr,
                                      RunWatchConnections, this) != 0) {
             LOG(FATAL) << "Fail to start bthread";
             return -1;
@@ -224,8 +234,7 @@ void SocketMap::ShowSocketMapInBvarIfNeed() {
 }
 
 int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
-                      const std::shared_ptr<SocketSSLContext>& ssl_ctx,
-                      bool use_rdma) {
+                      SocketOptions& opt) {
     ShowSocketMapInBvarIfNeed();
 
     std::unique_lock<butil::Mutex> mu(_mutex);
@@ -237,7 +246,7 @@ int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
             return 0;
         }
         // A socket w/o HC is failed (permanently), replace it.
-        sc->socket->ReleaseHCRelatedReference();
+        ReleaseReference(sc->socket);
         _map.erase(key); // in principle, we can override the entry in map w/o
         // removing and inserting it again. But this would make error branches
         // below have to remove the entry before returning, which is
@@ -245,10 +254,7 @@ int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
         sc = NULL;
     }
     SocketId tmp_id;
-    SocketOptions opt;
     opt.remote_side = key.peer.addr;
-    opt.initial_ssl_ctx = ssl_ctx;
-    opt.use_rdma = use_rdma;
     if (_options.socket_creator->CreateSocket(opt, &tmp_id) != 0) {
         PLOG(FATAL) << "Fail to create socket to " << key.peer;
         return -1;
@@ -265,7 +271,10 @@ int SocketMap::Insert(const SocketMapKey& key, SocketId* id,
         LOG(FATAL) << "Failed socket is not HC-enabled";
         return -1;
     }
-    SingleConnection new_sc = { 1, ptr.get(), 0 };
+    // If health check is enabled, a health-checking-related reference
+    // is hold in Socket::Create.
+    // If health check is disabled, hold a reference in SocketMap.
+    SingleConnection new_sc = { 1, ptr->HCEnabled() ? ptr.get() : ptr.release(), 0 };
     _map[key] = new_sc;
     *id = tmp_id;
     mu.unlock();
@@ -296,15 +305,38 @@ void SocketMap::RemoveInternal(const SocketMapKey& key,
             *_options.defer_close_second_dynamic
             : _options.defer_close_second;
         if (!remove_orphan && defer_close_second > 0) {
-            // Start count down on this Socket 
-            sc->no_ref_us = butil::cpuwide_time_us();
-        } else {
-            Socket* const s = sc->socket;
-            _map.erase(key);
-            mu.unlock();
-            s->ReleaseAdditionalReference(); // release extra ref
-            s->ReleaseHCRelatedReference();
+            const int64_t now_us = butil::cpuwide_time_us();
+            // NOTE: save the gflag which may be reloaded at any time
+            const bool defer_close_respect_idle = _options.defer_close_respect_idle_dynamic ?
+            *_options.defer_close_respect_idle_dynamic : false;
+            if (!defer_close_respect_idle) {
+                // Start count down on this Socket.
+                sc->no_ref_us = now_us;
+                return;
+            }
+            const int64_t defer_us = (int64_t)defer_close_second * 1000000L;
+            if (sc->no_ref_us <= sc->socket->last_active_time_us() + defer_us) {
+                // When defer_close_respect_idle is enabled, a connection that has
+                // already been idle for longer than defer_close_second is closed
+                // immediately.
+                sc->no_ref_us = now_us;
+                return;
+            }
         }
+        Socket* const s = sc->socket;
+        _map.erase(key);
+        mu.unlock();
+        s->ReleaseAdditionalReference(); // release extra ref
+        ReleaseReference(s);
+    }
+}
+
+void SocketMap::ReleaseReference(Socket* s) {
+    if (s->HCEnabled()) {
+        s->ReleaseHCRelatedReference();
+    } else {
+        // Release the extra ref hold in SocketMap::Insert.
+        SocketUniquePtr ptr(s);
     }
 }
 

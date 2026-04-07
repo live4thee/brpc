@@ -41,10 +41,13 @@ typedef std::map<ChannelBase*, Socket*> ChannelToIdMap;
 class SubChannel : public SocketUser {
 public:
     ChannelBase* chan;
+    ChannelOwnership ownership;
 
     // internal channel is deleted after the fake Socket is SetFailed
     void BeforeRecycle(Socket*) {
-        delete chan;
+        if (ownership == OWNS_CHANNEL) {
+            delete chan;
+        }
         delete this;
     }
 
@@ -84,8 +87,9 @@ public:
     ~ChannelBalancer();
     int Init(const char* lb_name);
     int AddChannel(ChannelBase* sub_channel,
+                   const SelectiveChannel::SubChannelOptions& subopt,
                    SelectiveChannel::ChannelHandle* handle);
-    void RemoveAndDestroyChannel(SelectiveChannel::ChannelHandle handle);
+    void RemoveAndDestroyChannel(const SelectiveChannel::ChannelHandle& handle);
     int SelectChannel(const LoadBalancer::SelectIn& in, SelectOut* out);
     int CheckHealth();
     void Describe(std::ostream& os, const DescribeOptions&);
@@ -169,6 +173,7 @@ int ChannelBalancer::Init(const char* lb_name) {
 }
 
 int ChannelBalancer::AddChannel(ChannelBase* sub_channel,
+                                const SelectiveChannel::SubChannelOptions& subopt,
                                 SelectiveChannel::ChannelHandle* handle) {
     if (NULL == sub_channel) {
         LOG(ERROR) << "Parameter[sub_channel] is NULL";
@@ -185,6 +190,7 @@ int ChannelBalancer::AddChannel(ChannelBase* sub_channel,
         return -1;
     }
     sub_chan->chan = sub_channel;
+    sub_chan->ownership = subopt.ownership;
     SocketId sock_id;
     SocketOptions options;
     options.user = sub_chan;
@@ -197,11 +203,16 @@ int ChannelBalancer::AddChannel(ChannelBase* sub_channel,
     }
     SocketUniquePtr ptr;
     int rc = Socket::AddressFailedAsWell(sock_id, &ptr);
-    if (rc < 0 || (rc > 0 && !ptr->HCEnabled())) {
-        LOG(FATAL) << "Fail to address SocketId=" << sock_id;
+    if (rc < 0) {
+        LOG(ERROR) << "Fail to address SocketId=" << sock_id;
         return -1;
     }
-    if (!AddServer(ServerId(sock_id))) {
+    if (rc > 0 && !ptr->HCEnabled()) {
+        LOG(ERROR) << "Health check of SocketId="
+                   << sock_id << " is disabled";
+        return -1;
+    }
+    if (!AddServer(ServerId(sock_id, subopt.tag))) {
         LOG(ERROR) << "Duplicated sub_channel=" << sub_channel;
         // sub_chan will be deleted when the socket is recycled.
         ptr->SetFailed();
@@ -210,19 +221,20 @@ int ChannelBalancer::AddChannel(ChannelBase* sub_channel,
         return -1;
     }
     // The health-check-related reference has been held on created.
-    _chan_map[sub_channel]= ptr.get();
+    _chan_map[sub_channel] = ptr.get();
     if (handle) {
-        *handle = sock_id;
+        handle->id = sock_id;
+        handle->tag = subopt.tag;
     }
     return 0;
 }
 
-void ChannelBalancer::RemoveAndDestroyChannel(SelectiveChannel::ChannelHandle handle) {
-    if (!RemoveServer(ServerId(handle))) {
+void ChannelBalancer::RemoveAndDestroyChannel(const SelectiveChannel::ChannelHandle& handle) {
+    if (!RemoveServer(ServerId(handle.id, handle.tag))) {
         return;
     }
     SocketUniquePtr ptr;
-    const int rc = Socket::AddressFailedAsWell(handle, &ptr);
+    const int rc = Socket::AddressFailedAsWell(handle.id, &ptr);
     if (rc >= 0) {
         SubChannel* sub = static_cast<SubChannel*>(ptr->user());
         {
@@ -306,8 +318,6 @@ int Sender::IssueRPC(int64_t start_realtime_us) {
         _main_cntl->SetFailed(rc, "Fail to select channel, %s", berror(rc));
         return -1;
     }
-    DLOG(INFO) << "Selected channel=" << sel_out.channel() << ", size="
-                << (_main_cntl->_accessed ? _main_cntl->_accessed->size() : 0);
     _main_cntl->_current_call.need_feedback = sel_out.need_feedback;
     _main_cntl->_current_call.peer_id = sel_out.fake_sock->id();
 
@@ -334,12 +344,13 @@ int Sender::IssueRPC(int64_t start_realtime_us) {
     sub_cntl->set_request_code(_main_cntl->request_code());
     // Forward request attachment to the subcall
     sub_cntl->request_attachment().append(_main_cntl->request_attachment());
-    
-    sel_out.channel()->CallMethod(_main_cntl->_method,
-                                  &r.sub_done->_cntl,
-                                  _request,
-                                  r.response,
-                                  r.sub_done);
+    ProtocolType protocol = _main_cntl->request_protocol();
+    if (PROTOCOL_HTTP == protocol || PROTOCOL_H2 == protocol) {
+        sub_cntl->http_request() = _main_cntl->http_request();
+    }
+
+    sel_out.channel()->CallMethod(_main_cntl->_method, &r.sub_done->_cntl,
+                                  _request, r.response, r.sub_done);
     return 0;
 }
 
@@ -353,12 +364,6 @@ void SubDone::Run() {
                    << _cid.value << ": " << berror(rc);
         return;
     }
-    // NOTE: Copying gettable-but-settable fields which are generally set
-    // during the RPC to reflect details.
-    main_cntl->_remote_side = _cntl._remote_side;
-    // connection_type may be changed during CallMethod. 
-    main_cntl->set_connection_type(_cntl.connection_type());
-    main_cntl->response_attachment().swap(_cntl.response_attachment());
     Resource r;
     r.response = _cntl._response;
     r.sub_done = this;
@@ -366,6 +371,13 @@ void SubDone::Run() {
         return;
     }
     const int saved_error = main_cntl->ErrorCode();
+
+    // NOTE: Copying gettable-but-settable fields which are generally set
+    // during the RPC to reflect details.
+    main_cntl->_remote_side = _cntl._remote_side;
+    // connection_type may be changed during CallMethod. 
+    main_cntl->set_connection_type(_cntl.connection_type());
+    main_cntl->response_attachment().swap(_cntl.response_attachment());
     
     if (_cntl.Failed()) {
         if (_cntl.ErrorCode() == ENODATA || _cntl.ErrorCode() == EHOSTDOWN) {
@@ -527,6 +539,7 @@ bool SelectiveChannel::initialized() const {
 }
 
 int SelectiveChannel::AddChannel(ChannelBase* sub_channel,
+                                 const SubChannelOptions& option,
                                  ChannelHandle* handle) {
     schan::ChannelBalancer* lb =
         static_cast<schan::ChannelBalancer*>(_chan._lb.get());
@@ -534,10 +547,10 @@ int SelectiveChannel::AddChannel(ChannelBase* sub_channel,
         LOG(ERROR) << "You must call Init() to initialize a SelectiveChannel";
         return -1;
     }
-    return lb->AddChannel(sub_channel, handle);
+    return lb->AddChannel(sub_channel, option, handle);
 }
 
-void SelectiveChannel::RemoveAndDestroyChannel(ChannelHandle handle) {
+void SelectiveChannel::RemoveAndDestroyChannel(const ChannelHandle& handle) {
     schan::ChannelBalancer* lb =
         static_cast<schan::ChannelBalancer*>(_chan._lb.get());
     if (lb == NULL) {

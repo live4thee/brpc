@@ -77,13 +77,13 @@ private:
                             int64_t interval_us);
 
     static void* run_grab_thread(void* arg) {
-        butil::PlatformThread::SetName("bvar_collector_grabber");
+        butil::PlatformThread::SetNameSimple("bvar_collector_grabber");
         static_cast<Collector*>(arg)->grab_thread();
         return NULL;
     }
 
     static void* run_dump_thread(void* arg) {
-        butil::PlatformThread::SetName("bvar_collector_dumper");
+        butil::PlatformThread::SetNameSimple("bvar_collector_dumper");
         static_cast<Collector*>(arg)->dump_thread();
         return NULL;
     }
@@ -410,6 +410,11 @@ void Collector::dump_thread() {
     }
 }
 
+// Submit a sample for asynchronous dumping. The Collector holds only the Collected*
+// pointer (e.g., SpanContainer*). Regardless of which branch is taken below, the
+// sample will eventually be destroyed via either dump_and_destroy() or destroy(),
+// both of which call 'delete this' to release the container and decrement the
+// reference count of any managed resources (e.g., shared_ptr<Span>).
 void Collected::submit(int64_t cpuwide_us) {
     Collector* d = butil::get_leaky_singleton<Collector>();
     // Destroy the sample in-place if the grab_thread did not run for twice

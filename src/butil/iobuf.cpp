@@ -31,6 +31,7 @@
 #include <errno.h>                         // errno
 #include <limits.h>                        // CHAR_BIT
 #include <stdexcept>                       // std::invalid_argument
+#include <gflags/gflags.h>                 // gflags
 #include "butil/build_config.h"             // ARCH_CPU_X86_64
 #include "butil/atomicops.h"                // butil::atomic
 #include "butil/thread_local.h"             // thread_atexit
@@ -42,6 +43,8 @@
 
 namespace butil {
 namespace iobuf {
+
+DEFINE_int32(iobuf_aligned_buf_block_size, 0, "iobuf aligned buf block size");
 
 typedef ssize_t (*iov_function)(int fd, const struct iovec *vector,
                                    int count, off_t offset);
@@ -180,6 +183,20 @@ butil::static_atomic<size_t> g_nblock = BUTIL_STATIC_ATOMIC_INIT(0);
 butil::static_atomic<size_t> g_blockmem = BUTIL_STATIC_ATOMIC_INIT(0);
 butil::static_atomic<size_t> g_newbigview = BUTIL_STATIC_ATOMIC_INIT(0);
 
+void inc_g_nblock() {
+    g_nblock.fetch_add(1, butil::memory_order_relaxed);
+}
+void dec_g_nblock() {
+    g_nblock.fetch_sub(1, butil::memory_order_relaxed);
+}
+
+void inc_g_blockmem() {
+    g_blockmem.fetch_add(1, butil::memory_order_relaxed);
+}
+void dec_g_blockmem() {
+    g_blockmem.fetch_sub(1, butil::memory_order_relaxed);
+}
+
 }  // namespace iobuf
 
 size_t IOBuf::block_count() {
@@ -193,133 +210,6 @@ size_t IOBuf::block_memory() {
 size_t IOBuf::new_bigview_count() {
     return iobuf::g_newbigview.load(butil::memory_order_relaxed);
 }
-
-const uint16_t IOBUF_BLOCK_FLAGS_USER_DATA = 1 << 0;
-const uint16_t IOBUF_BLOCK_FLAGS_SAMPLED = 1 << 1;
-using UserDataDeleter = std::function<void(void*)>;
-
-struct UserDataExtension {
-    UserDataDeleter deleter;
-};
-
-struct IOBuf::Block {
-    butil::atomic<int> nshared;
-    uint16_t flags;
-    uint16_t abi_check;  // original cap, never be zero.
-    uint32_t size;
-    uint32_t cap;
-    // When flag is 0, portal_next is valid.
-    // When flag & IOBUF_BLOCK_FLAGS_USER_DATA is non-0, data_meta is valid.
-    union {
-        Block* portal_next;
-        uint64_t data_meta;
-    } u;
-    // When flag is 0, data points to `size` bytes starting at `(char*)this+sizeof(Block)'
-    // When flag & IOBUF_BLOCK_FLAGS_USER_DATA is non-0, data points to the user data and
-    // the deleter is put in UserDataExtension at `(char*)this+sizeof(Block)'
-    char* data;
-        
-    Block(char* data_in, uint32_t data_size)
-        : nshared(1)
-        , flags(0)
-        , abi_check(0)
-        , size(0)
-        , cap(data_size)
-        , u({NULL})
-        , data(data_in) {
-        iobuf::g_nblock.fetch_add(1, butil::memory_order_relaxed);
-        iobuf::g_blockmem.fetch_add(data_size + sizeof(Block),
-                                    butil::memory_order_relaxed);
-        if (is_samplable()) {
-            SubmitIOBufSample(this, 1);
-        }
-    }
-
-    Block(char* data_in, uint32_t data_size, UserDataDeleter deleter)
-        : nshared(1)
-        , flags(IOBUF_BLOCK_FLAGS_USER_DATA)
-        , abi_check(0)
-        , size(data_size)
-        , cap(data_size)
-        , u({0})
-        , data(data_in) {
-        auto ext = new (get_user_data_extension()) UserDataExtension();
-        ext->deleter = std::move(deleter);
-        if (is_samplable()) {
-            SubmitIOBufSample(this, 1);
-        }
-    }
-
-    // Undefined behavior when (flags & IOBUF_BLOCK_FLAGS_USER_DATA) is 0.
-    UserDataExtension* get_user_data_extension() {
-        char* p = (char*)this;
-        return (UserDataExtension*)(p + sizeof(Block));
-    }
-
-    inline void check_abi() {
-#ifndef NDEBUG
-        if (abi_check != 0) {
-            LOG(FATAL) << "Your program seems to wrongly contain two "
-                "ABI-incompatible implementations of IOBuf";
-        }
-#endif
-    }
-
-    void inc_ref() {
-        check_abi();
-        nshared.fetch_add(1, butil::memory_order_relaxed);
-        if (sampled()) {
-            SubmitIOBufSample(this, 1);
-        }
-    }
-        
-    void dec_ref() {
-        check_abi();
-        if (sampled()) {
-            SubmitIOBufSample(this, -1);
-        }
-        if (nshared.fetch_sub(1, butil::memory_order_release) == 1) {
-            butil::atomic_thread_fence(butil::memory_order_acquire);
-            if (!is_user_data()) {
-                iobuf::g_nblock.fetch_sub(1, butil::memory_order_relaxed);
-                iobuf::g_blockmem.fetch_sub(cap + sizeof(Block),
-                                            butil::memory_order_relaxed);
-                this->~Block();
-                iobuf::blockmem_deallocate(this);
-            } else if (flags & IOBUF_BLOCK_FLAGS_USER_DATA) {
-                auto ext = get_user_data_extension();
-                ext->deleter(data);
-                ext->~UserDataExtension();
-                this->~Block();
-                free(this);
-            }
-        }
-    }
-
-    int ref_count() const {
-        return nshared.load(butil::memory_order_relaxed);
-    }
-
-    bool full() const { return size >= cap; }
-    size_t left_space() const { return cap - size; }
-
-private:
-    bool is_samplable() {
-        if (IsIOBufProfilerSamplable()) {
-            flags |= IOBUF_BLOCK_FLAGS_SAMPLED;
-            return true;
-        }
-        return false;
-    }
-
-    bool sampled() const {
-        return flags & IOBUF_BLOCK_FLAGS_SAMPLED;
-    }
-
-    bool is_user_data() const {
-        return flags & IOBUF_BLOCK_FLAGS_USER_DATA;
-    }
-};
 
 namespace iobuf {
 
@@ -338,7 +228,7 @@ uint32_t block_size(IOBuf::Block const* b) {
     return b->size;
 }
 
-inline IOBuf::Block* create_block(const size_t block_size) {
+inline IOBuf::Block* create_block_aligned(size_t block_size, size_t alignment) {
     if (block_size > 0xFFFFFFFFULL) {
         LOG(FATAL) << "block_size=" << block_size << " is too large";
         return NULL;
@@ -347,37 +237,20 @@ inline IOBuf::Block* create_block(const size_t block_size) {
     if (mem == NULL) {
         return NULL;
     }
-    return new (mem) IOBuf::Block(mem + sizeof(IOBuf::Block),
-                                  block_size - sizeof(IOBuf::Block));
-}
-
-inline IOBuf::Block* create_block() {
-    return create_block(IOBuf::DEFAULT_BLOCK_SIZE);
+    char* data = mem + sizeof(IOBuf::Block);
+    // change data pointer & data size make align satisfied
+    size_t adder = (-reinterpret_cast<uintptr_t>(data)) & (alignment - 1);
+    size_t size =
+        (block_size - sizeof(IOBuf::Block) - adder) & ~(alignment - 1);
+    return new (mem) IOBuf::Block(data + adder, size);
 }
 
 // === Share TLS blocks between appending operations ===
-// Max number of blocks in each TLS. This is a soft limit namely
-// release_tls_block_chain() may exceed this limit sometimes.
-const int MAX_BLOCKS_PER_THREAD = 8;
-
-inline int max_blocks_per_thread() {
-    // If IOBufProfiler is enabled, do not cache blocks in TLS.
-    return IsIOBufProfilerEnabled() ? 0 : MAX_BLOCKS_PER_THREAD;
-}
-
-struct TLSData {
-    // Head of the TLS block chain.
-    IOBuf::Block* block_head;
-    
-    // Number of TLS blocks
-    int num_blocks;
-    
-    // True if the remote_tls_block_chain is registered to the thread.
-    bool registered;
-};
 
 static __thread TLSData g_tls_data = { NULL, 0, false };
 
+// Used in release_tls_block()
+TLSData* get_g_tls_data() { return &g_tls_data; }
 // Used in UT
 IOBuf::Block* get_tls_block_head() { return g_tls_data.block_head; }
 int get_tls_block_count() { return g_tls_data.num_blocks; }
@@ -386,6 +259,14 @@ int get_tls_block_count() { return g_tls_data.num_blocks; }
 // already. This counter should be 0 in most scenarios, otherwise performance
 // of appending functions in IOPortal may be lowered.
 static butil::static_atomic<size_t> g_num_hit_tls_threshold = BUTIL_STATIC_ATOMIC_INIT(0);
+
+void inc_g_num_hit_tls_threshold() {
+    g_num_hit_tls_threshold.fetch_add(1, butil::memory_order_relaxed);
+}
+
+void dec_g_num_hit_tls_threshold() {
+    g_num_hit_tls_threshold.fetch_sub(1, butil::memory_order_relaxed);
+}
 
 // Called in UT.
 void remove_tls_block_chain() {
@@ -436,28 +317,6 @@ IOBuf::Block* share_tls_block() {
     }
     tls_data.block_head = new_block;
     return new_block;
-}
-
-// Return one block to TLS.
-inline void release_tls_block(IOBuf::Block* b) {
-    if (!b) {
-        return;
-    }
-    TLSData& tls_data = g_tls_data;
-    if (b->full()) {
-        b->dec_ref();
-    } else if (tls_data.num_blocks >= max_blocks_per_thread()) {
-        b->dec_ref();
-        g_num_hit_tls_threshold.fetch_add(1, butil::memory_order_relaxed);
-    } else {
-        b->u.portal_next = tls_data.block_head;
-        tls_data.block_head = b;
-        ++tls_data.num_blocks;
-        if (!tls_data.registered) {
-            tls_data.registered = true;
-            butil::thread_atexit(remove_tls_block_chain);
-        }
-    }
 }
 
 // Return chained blocks to TLS.
@@ -1070,16 +929,17 @@ ssize_t IOBuf::cut_multiple_into_SSL_channel(SSL* ssl, IOBuf* const* pieces,
     }
 
 #ifndef USE_MESALINK
-    // Flush remaining data inside the BIO buffer layer
-    BIO* wbio = SSL_get_wbio(ssl);
-    if (BIO_wpending(wbio) > 0) {
-        int rc = BIO_flush(wbio);
-        if (rc <= 0 && BIO_fd_non_fatal_error(errno) == 0) {
-            // Fatal error during BIO_flush
-            *ssl_error = SSL_ERROR_SYSCALL;
-            return rc;
-        }
-    }
+    // BIO is disabled for now (see socket.cpp) and the following implementation is
+    // NOT correct since it doesn't handle the EAGAIN event of BIO_flush
+//    BIO* wbio = SSL_get_wbio(ssl);
+//    if (BIO_wpending(wbio) > 0) {
+//        int rc = BIO_flush(wbio);
+//        if (rc <= 0 && BIO_fd_non_fatal_error(errno) == 0) {
+//            // Fatal error during BIO_flush
+//            *ssl_error = SSL_ERROR_SYSCALL;
+//            return rc;
+//        }
+//    }
 #else
     int rc = SSL_flush(ssl);
     if (rc <= 0) {
@@ -1785,6 +1645,48 @@ void IOPortal::return_cached_blocks_impl(Block* b) {
     iobuf::release_tls_block_chain(b);
 }
 
+IOBuf::Area IOReserveAlignedBuf::reserve(size_t count) {
+    IOBuf::Area result = INVALID_AREA;
+    if (_reserved == true) {
+        LOG(ERROR) << "Already call reserved";
+        return result;
+    }
+    _reserved = true;
+    bool is_power_two = _alignment > 0 && (_alignment & (_alignment - 1));
+    if (is_power_two != 0) {
+        LOG(ERROR) << "Invalid alignment, must power of two";
+        return INVALID_AREA;
+    }
+    count = (count + _alignment - 1) & ~(_alignment - 1);
+    size_t total_nc = 0;
+    while (total_nc < count) {
+        auto block_size =
+            std::max(_alignment, 4096UL) * 2 + sizeof(IOBuf::Block);
+        if (iobuf::FLAGS_iobuf_aligned_buf_block_size != 0) {
+            block_size = iobuf::FLAGS_iobuf_aligned_buf_block_size;
+        }
+        auto b = iobuf::create_block_aligned(block_size, _alignment);
+        if (BAIDU_UNLIKELY(!b)) {
+            LOG(ERROR) << "Create block failed";
+            return result;
+        }
+        const size_t nc = std::min(count - total_nc, b->left_space());
+        const IOBuf::BlockRef r = {(uint32_t)b->size, (uint32_t)nc, b};
+        _push_back_ref(r);
+        // aligned block is not from tls, release block ref
+        b->dec_ref();
+        if (total_nc == 0) {
+            // Encode the area at first time. Notice that the pushed ref may
+            // be merged with existing ones.
+            result = make_area(_ref_num() - 1, _back_ref().length - nc, count);
+        }
+        // add total nc
+        total_nc += nc;
+        b->size += nc;
+    };
+    return result;
+}
+
 //////////////// IOBufCutter ////////////////
 
 IOBufCutter::IOBufCutter(butil::IOBuf* buf)
@@ -1947,10 +1849,14 @@ void IOBufAsZeroCopyInputStream::BackUp(int count) {
     }
 }
 
-// Skips a number of bytes.  Returns false if the end of the stream is
-// reached or some input error occurred.  In the end-of-stream case, the
-// stream is advanced to the end of the stream (so ByteCount() will return
-// the total size of the stream).
+// Skips `count` number of bytes.
+// Returns true on success, or false if some input error occurred, or `count`
+// exceeds the end of the stream. This function may skip up to `count - 1`
+// bytes in case of failure.
+//
+// Preconditions:
+// * `count` is non-negative.
+//
 bool IOBufAsZeroCopyInputStream::Skip(int count) {
     const IOBuf::BlockRef* cur_ref = _buf->_pref_at(_ref_index);
     while (cur_ref) {
@@ -1965,10 +1871,10 @@ bool IOBufAsZeroCopyInputStream::Skip(int count) {
         _byte_count += left_bytes;
         cur_ref = _buf->_pref_at(++_ref_index);
     }
-    return false;
+    return (0 == count);
 }
 
-google::protobuf::int64 IOBufAsZeroCopyInputStream::ByteCount() const {
+int64_t IOBufAsZeroCopyInputStream::ByteCount() const {
     return _byte_count;
 }
 
@@ -2089,7 +1995,7 @@ void IOBufAsZeroCopyOutputStream::BackUp(int count) {
     LOG_IF(FATAL, count != 0) << "BackUp an empty IOBuf";
 }
 
-google::protobuf::int64 IOBufAsZeroCopyOutputStream::ByteCount() const {
+int64_t IOBufAsZeroCopyOutputStream::ByteCount() const {
     return _byte_count;
 }
 
@@ -2200,4 +2106,4 @@ bool IOBufBytesIterator::forward_one_block(const void** data, size_t* size) {
 
 void* fast_memcpy(void *__restrict dest, const void *__restrict src, size_t n) {
     return butil::iobuf::cp(dest, src, n);
-}
+} // namespace butil

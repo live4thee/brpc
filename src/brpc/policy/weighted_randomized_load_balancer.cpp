@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "butil/fast_rand.h"
+#include "bthread/prime_offset.h"
 #include "brpc/socket.h"
 #include "brpc/policy/weighted_randomized_load_balancer.h"
 #include "butil/strings/string_number_conversions.h"
@@ -26,8 +27,9 @@
 namespace brpc {
 namespace policy {
 
-static bool server_compare(const WeightedRandomizedLoadBalancer::Server& lhs, const WeightedRandomizedLoadBalancer::Server& rhs) {
-        return (lhs.current_weight_sum < rhs.current_weight_sum);
+static bool server_compare(const WeightedRandomizedLoadBalancer::Server& lhs,
+                           const WeightedRandomizedLoadBalancer::Server& rhs) {
+        return lhs.current_weight_sum < rhs.current_weight_sum;
 }
 
 bool WeightedRandomizedLoadBalancer::Add(Servers& bg, const ServerId& id) {
@@ -38,7 +40,8 @@ bool WeightedRandomizedLoadBalancer::Add(Servers& bg, const ServerId& id) {
     if (!butil::StringToUint(id.tag, &weight) || weight <= 0) {
         if (FLAGS_default_weight_of_wlb > 0) {
             LOG(WARNING) << "Invalid weight is set: " << id.tag
-                         << ". Now, 'weight' has been set to 'FLAGS_default_weight_of_wlb' by default.";
+                         << ". Now, 'weight' has been set to "
+                            "FLAGS_default_weight_of_wlb by default.";
             weight = FLAGS_default_weight_of_wlb;
         } else {
             LOG(ERROR) << "Invalid weight is set: " << id.tag;
@@ -46,7 +49,7 @@ bool WeightedRandomizedLoadBalancer::Add(Servers& bg, const ServerId& id) {
         }
     }
     bool insert_server =
-             bg.server_map.emplace(id.id, bg.server_list.size()).second;
+        bg.server_map.emplace(id.id, bg.server_list.size()).second;
     if (insert_server) {
         uint64_t current_weight_sum = bg.weight_sum + weight;
         bg.server_list.emplace_back(id.id, weight, current_weight_sum);
@@ -123,23 +126,49 @@ int WeightedRandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
     if (n == 0) {
         return ENODATA;
     }
+
+    butil::FlatSet<SocketId> random_traversed;
     uint64_t weight_sum = s->weight_sum;
     for (size_t i = 0; i < n; ++i) {
         uint64_t random_weight = butil::fast_rand_less_than(weight_sum);
         const Server random_server(0, 0, random_weight);
-        const auto& server = std::lower_bound(s->server_list.begin(), s->server_list.end(), random_server, server_compare);
+        const auto& server =
+            std::lower_bound(s->server_list.begin(), s->server_list.end(),
+                             random_server, server_compare);
         const SocketId id = server->id;
-        if (((i + 1) == n  // always take last chance
-             || !ExcludedServers::IsExcluded(in.excluded, id))
-            && Socket::Address(id, out->ptr) == 0
-            && (*out->ptr)->IsAvailable()) {
-            // We found an available server
+        if (ExcludedServers::IsExcluded(in.excluded, id)) {
+            continue;
+        }
+        random_traversed.insert(id);
+        if (IsServerAvailable(id, out->ptr)) {
+            // An available server is found.
             return 0;
         }
     }
-    // After we traversed the whole server list, there is still no
-    // available server
-    return EHOSTDOWN;
+
+    if (random_traversed.size() < n) {
+        // Try to traverse the remaining servers to find an available server.
+        uint32_t offset = butil::fast_rand_less_than(n);
+        uint32_t stride = bthread::prime_offset();
+        for (size_t i = 0; i < n; ++i) {
+            offset = (offset + stride) % n;
+            SocketId id = s->server_list[offset].id;
+            if (NULL != random_traversed.seek(id)) {
+                continue;
+            }
+            if (IsServerAvailable(id, out->ptr)) {
+                if (!ExcludedServers::IsExcluded(in.excluded, id)) {
+                    // Prioritize servers that are not excluded.
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // Returns EHOSTDOWN, if no available server is found
+    // after traversing the whole server list.
+    // Otherwise, returns 0 with a available excluded server.
+    return NULL == out->ptr ? EHOSTDOWN : 0;
 }
 
 LoadBalancer* WeightedRandomizedLoadBalancer::New(

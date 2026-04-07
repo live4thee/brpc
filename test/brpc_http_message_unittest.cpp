@@ -32,7 +32,7 @@ DECLARE_bool(allow_http_1_1_request_without_host);
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     brpc::FLAGS_allow_http_1_1_request_without_host = true;
     return RUN_ALL_TESTS();
 }
@@ -77,7 +77,7 @@ TEST(HttpMessageTest, http_method) {
 }
 
 TEST(HttpMessageTest, eof) {
-    GFLAGS_NS::SetCommandLineOption("verbose", "100");
+    GFLAGS_NAMESPACE::SetCommandLineOption("verbose", "100");
     const char* http_request = 
         "GET /CloudApiControl/HttpServer/telematics/v3/weather?location=%E6%B5%B7%E5%8D%97%E7%9C%81%E7%9B%B4%E8%BE%96%E5%8E%BF%E7%BA%A7%E8%A1%8C%E6%94%BF%E5%8D%95%E4%BD%8D&output=json&ak=0l3FSP6qA0WbOzGRaafbmczS HTTP/1.1\r\n"
         "X-Host: api.map.baidu.com\r\n"
@@ -224,8 +224,10 @@ TEST(HttpMessageTest, parse_from_iobuf) {
             "Content-Length: %lu\r\n"
             "\r\n",
             content_length);
-    std::string content;
-    for (size_t i = 0; i < content_length; ++i) content.push_back('2');
+    butil::IOBuf content;
+    for (size_t i = 0; i < content_length; ++i) {
+        content.push_back('2');
+    }
     butil::IOBuf request;
     request.append(header);
     request.append(content);
@@ -233,6 +235,7 @@ TEST(HttpMessageTest, parse_from_iobuf) {
     brpc::HttpMessage http_message;
     ASSERT_TRUE(http_message.ParseFromIOBuf(request) >= 0);
     ASSERT_TRUE(http_message.Completed());
+    ASSERT_EQ(content, http_message.body());
     ASSERT_EQ(content, http_message.body().to_string());
     ASSERT_EQ("text/plain", http_message.header().content_type());
 }
@@ -610,27 +613,27 @@ TEST(HttpMessageTest, serialize_http_request) {
     // user-set accept
     header.SetHeader("accePT"/*intended uppercase*/, "blahblah");
     MakeRawHttpRequest(&request, &header, ep, &content);
-    ASSERT_EQ("POST / HTTP/1.1\r\nContent-Length: 4\r\naccePT: blahblah\r\nFoo: Bar\r\nHost: MyHost: 4321\r\nUser-Agent: brpc/1.0 curl/7.0\r\n\r\ndata", request);
+    ASSERT_EQ("POST / HTTP/1.1\r\nContent-Length: 4\r\nFoo: Bar\r\naccePT: blahblah\r\nHost: MyHost: 4321\r\nUser-Agent: brpc/1.0 curl/7.0\r\n\r\ndata", request);
 
     // user-set UA
     header.SetHeader("user-AGENT", "myUA");
     MakeRawHttpRequest(&request, &header, ep, &content);
-    ASSERT_EQ("POST / HTTP/1.1\r\nContent-Length: 4\r\naccePT: blahblah\r\nuser-AGENT: myUA\r\nFoo: Bar\r\nHost: MyHost: 4321\r\n\r\ndata", request);
+    ASSERT_EQ("POST / HTTP/1.1\r\nContent-Length: 4\r\nFoo: Bar\r\naccePT: blahblah\r\nHost: MyHost: 4321\r\nuser-AGENT: myUA\r\n\r\ndata", request);
 
     // user-set Authorization
     header.SetHeader("authorization", "myAuthString");
     MakeRawHttpRequest(&request, &header, ep, &content);
-    ASSERT_EQ("POST / HTTP/1.1\r\nContent-Length: 4\r\naccePT: blahblah\r\nuser-AGENT: myUA\r\nauthorization: myAuthString\r\nFoo: Bar\r\nHost: MyHost: 4321\r\n\r\ndata", request);
+    ASSERT_EQ("POST / HTTP/1.1\r\nContent-Length: 4\r\nFoo: Bar\r\naccePT: blahblah\r\nHost: MyHost: 4321\r\nuser-AGENT: myUA\r\nauthorization: myAuthString\r\n\r\ndata", request);
 
     header.SetHeader("Transfer-Encoding", "chunked");
     MakeRawHttpRequest(&request, &header, ep, &content);
-    ASSERT_EQ("POST / HTTP/1.1\r\naccePT: blahblah\r\nTransfer-Encoding: chunked\r\nuser-AGENT: myUA\r\nauthorization: myAuthString\r\nFoo: Bar\r\nHost: MyHost: 4321\r\n\r\ndata", request);
+    ASSERT_EQ("POST / HTTP/1.1\r\nFoo: Bar\r\naccePT: blahblah\r\nTransfer-Encoding: chunked\r\nHost: MyHost: 4321\r\nuser-AGENT: myUA\r\nauthorization: myAuthString\r\n\r\ndata", request);
 
     // GET does not serialize content and user-set content-length is ignored.
     header.set_method(brpc::HTTP_METHOD_GET);
     header.SetHeader("Content-Length", "100");
     MakeRawHttpRequest(&request, &header, ep, &content);
-    ASSERT_EQ("GET / HTTP/1.1\r\naccePT: blahblah\r\nuser-AGENT: myUA\r\nauthorization: myAuthString\r\nFoo: Bar\r\nHost: MyHost: 4321\r\n\r\n", request);
+    ASSERT_EQ("GET / HTTP/1.1\r\nFoo: Bar\r\naccePT: blahblah\r\nHost: MyHost: 4321\r\nuser-AGENT: myUA\r\nauthorization: myAuthString\r\n\r\n", request);
 }
 
 TEST(HttpMessageTest, serialize_http_response) {
@@ -649,12 +652,12 @@ TEST(HttpMessageTest, serialize_http_response) {
     // NULL content
     header.SetHeader("Content-Length", "100");
     MakeRawHttpResponse(&response, &header, NULL);
-    ASSERT_EQ("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nFoo: Bar\r\n\r\n", response)
+    ASSERT_EQ("HTTP/1.1 200 OK\r\nFoo: Bar\r\nContent-Length: 100\r\n\r\n", response)
         << butil::ToPrintable(response);
 
     header.SetHeader("Transfer-Encoding", "chunked");
     MakeRawHttpResponse(&response, &header, NULL);
-    ASSERT_EQ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nFoo: Bar\r\n\r\n", response)
+    ASSERT_EQ("HTTP/1.1 200 OK\r\nFoo: Bar\r\nTransfer-Encoding: chunked\r\n\r\n", response)
                     << butil::ToPrintable(response);
     header.RemoveHeader("Transfer-Encoding");
 
@@ -667,7 +670,7 @@ TEST(HttpMessageTest, serialize_http_response) {
     header.SetHeader("Content-Length", "100");
     header.SetHeader("Transfer-Encoding", "chunked");
     MakeRawHttpResponse(&response, &header, NULL);
-    ASSERT_EQ("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nFoo: Bar\r\n\r\n", response)
+    ASSERT_EQ("HTTP/1.1 200 OK\r\nFoo: Bar\r\nTransfer-Encoding: chunked\r\n\r\n", response)
                     << butil::ToPrintable(response);
     header.RemoveHeader("Transfer-Encoding");
 
@@ -696,7 +699,7 @@ TEST(HttpMessageTest, serialize_http_response) {
     // 2. User-set content-length is not ignored .
     header.SetHeader("Content-Length", "100");
     MakeRawHttpResponse(&response, &header, &content);
-    ASSERT_EQ("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nFoo: Bar\r\n\r\n", response)
+    ASSERT_EQ("HTTP/1.1 200 OK\r\nFoo: Bar\r\nContent-Length: 100\r\n\r\n", response)
         << butil::ToPrintable(response);
 }
 

@@ -25,14 +25,15 @@
 #ifndef NDEBUG
 #include <iostream>                             // std::ostream
 #endif
+#include <signal.h>
 #include <stddef.h>                             // size_t
 #include <vector>
 #include <array>
 #include <memory>
 #include "butil/atomicops.h"                     // butil::atomic
 #include "bvar/bvar.h"                          // bvar::PassiveStatus
+#include "bthread/task_tracer.h"
 #include "bthread/task_meta.h"                  // TaskMeta
-#include "butil/resource_pool.h"                 // ResourcePool
 #include "bthread/work_stealing_queue.h"        // WorkStealingQueue
 #include "bthread/parking_lot.h"
 
@@ -43,7 +44,11 @@ class TaskGroup;
 
 // Control all task groups
 class TaskControl {
-    friend class TaskGroup;
+friend class TaskGroup;
+friend void wait_for_butex(void*);
+#ifdef BRPC_BTHREAD_TRACER
+friend bthread_t init_for_pthread_stack_trace();
+#endif // BRPC_BTHREAD_TRACER
 
 public:
     TaskControl();
@@ -74,7 +79,7 @@ public:
     void print_rq_sizes(std::ostream& os);
 
     double get_cumulated_worker_time();
-    double get_cumulated_worker_time_with_tag(bthread_tag_t tag);
+    double get_cumulated_worker_time(bthread_tag_t tag);
     int64_t get_cumulated_switch_count();
     int64_t get_cumulated_signal_count();
 
@@ -86,10 +91,24 @@ public:
     // If this method is called after init(), it never returns NULL.
     TaskGroup* choose_one_group(bthread_tag_t tag);
 
+    static int parse_cpuset(std::string value, std::vector<unsigned>& cpus);
+
+    static void bind_thread_to_cpu(pthread_t pthread, unsigned cpu_id);
+
+#ifdef BRPC_BTHREAD_TRACER
+    // A stacktrace of bthread can be helpful in debugging.
+    void stack_trace(std::ostream& os, bthread_t tid);
+    std::string stack_trace(bthread_t tid);
+#endif // BRPC_BTHREAD_TRACER
+
+    void push_priority_queue(bthread_tag_t tag, bthread_t tid) {
+        _priority_queues[tag].push(tid);
+    }
+
+    std::vector<bthread_t> get_living_bthreads();
 private:
     typedef std::array<TaskGroup*, BTHREAD_MAX_CONCURRENCY> TaggedGroups;
-    static const int PARKING_LOT_NUM = 4;
-    typedef std::array<ParkingLot, PARKING_LOT_NUM> TaggedParkingLot;
+    typedef std::array<ParkingLot, BTHREAD_MAX_PARKINGLOT> TaggedParkingLot;
     // Add/Remove a TaskGroup.
     // Returns 0 on success, -1 otherwise.
     int _add_group(TaskGroup*, bthread_tag_t tag);
@@ -102,7 +121,7 @@ private:
     butil::atomic<size_t>& tag_ngroup(int tag) { return _tagged_ngroup[tag]; }
 
     // Tag parking slot
-    TaggedParkingLot& tag_pl(bthread_tag_t tag) { return _pl[tag]; }
+    TaggedParkingLot& tag_pl(bthread_tag_t tag) { return _tagged_pl[tag]; }
 
     static void delete_task_group(void* arg);
 
@@ -124,6 +143,7 @@ private:
     bool _stop;
     butil::atomic<int> _concurrency;
     std::vector<pthread_t> _workers;
+    std::vector<unsigned> _cpus;
     butil::atomic<int> _next_worker_id;
 
     bvar::Adder<int64_t> _nworkers;
@@ -143,7 +163,16 @@ private:
     std::vector<bvar::PerSecond<bvar::PassiveStatus<double>>*> _tagged_worker_usage_second;
     std::vector<bvar::Adder<int64_t>*> _tagged_nbthreads;
 
-    std::vector<TaggedParkingLot> _pl;
+    bool _enable_priority_queue;
+    std::vector<WorkStealingQueue<bthread_t>> _priority_queues;
+
+    size_t _pl_num_of_each_tag;
+    std::vector<TaggedParkingLot> _tagged_pl;
+
+#ifdef BRPC_BTHREAD_TRACER
+    TaskTracer _task_tracer;
+#endif // BRPC_BTHREAD_TRACER
+
 };
 
 inline bvar::LatencyRecorder& TaskControl::exposed_pending_time() {

@@ -27,6 +27,7 @@ message EchoRequest {
     optional bool close_fd = 3;
     optional int32 sleep_us = 4;
     optional int32 server_fail = 5;
+    optional string http_header = 6;
 };
 
 message EchoResponse {
@@ -110,3 +111,8 @@ message Message1 {
 message Message2 {
     required State1 stat = 1;
 };
+
+message RecursiveMessage {
+  optional RecursiveMessage child = 1;
+  optional string data = 2;
+}

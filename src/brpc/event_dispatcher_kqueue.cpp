@@ -69,11 +69,16 @@ int EventDispatcher::Start(const bthread_attr_t* thread_attr) {
 
     // Set _thread_attr before creating kqueue thread to make sure
     // everyting seems sane to the thread.
-    _thread_attr = (thread_attr ? *thread_attr : BTHREAD_ATTR_NORMAL);
+    if (thread_attr) {
+        _thread_attr = *thread_attr;
+    }
 
     //_thread_attr is used in StartInputEvent(), assign flag NEVER_QUIT to it will cause new bthread
     // that created by kevent() never to quit.
-    bthread_attr_t kqueue_thread_attr = _thread_attr | BTHREAD_NEVER_QUIT;
+    // Only event dispatcher thread has flag BTHREAD_GLOBAL_PRIORITY.
+    bthread_attr_t kqueue_thread_attr =
+        _thread_attr | BTHREAD_NEVER_QUIT | BTHREAD_GLOBAL_PRIORITY;
+    bthread_attr_set_name(&kqueue_thread_attr, "EventDispatcher::RunThis");
 
     // Polling thread uses the same attr for consumer threads (NORMAL right
     // now). Previously, we used small stack (32KB) which may be overflowed
@@ -205,16 +210,20 @@ void EventDispatcher::Run() {
         }
         for (int i = 0; i < n; ++i) {
             if ((e[i].flags & EV_ERROR) || e[i].filter == EVFILT_READ) {
+                int64_t start_ns = butil::cpuwide_time_ns();
                 // We don't care about the return value.
                 CallInputEventCallback((IOEventDataId)e[i].udata,
                                        e[i].filter, _thread_attr);
+                (*g_edisp_read_lantency) << (butil::cpuwide_time_ns() - start_ns);
             }
         }
         for (int i = 0; i < n; ++i) {
             if ((e[i].flags & EV_ERROR) || e[i].filter == EVFILT_WRITE) {
+                int64_t start_ns = butil::cpuwide_time_ns();
                 // We don't care about the return value.
                 CallOutputEventCallback((IOEventDataId)e[i].udata,
                                         e[i].filter, _thread_attr);
+                (*g_edisp_write_lantency) << (butil::cpuwide_time_ns() - start_ns);
             }
         }
     }

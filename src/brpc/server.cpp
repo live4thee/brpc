@@ -24,14 +24,17 @@
 #include <google/protobuf/descriptor.h>             // ServiceDescriptor
 #include "idl_options.pb.h"                         // option(idl_support)
 #include "bthread/unstable.h"                       // bthread_keytable_pool_init
-#include "butil/macros.h"                            // ARRAY_SIZE
-#include "butil/fd_guard.h"                          // fd_guard
-#include "butil/logging.h"                           // CHECK
+#include "butil/macros.h"                           // ARRAY_SIZE
+#include "butil/fd_guard.h"                         // fd_guard
+#include "butil/logging.h"                          // CHECK
 #include "butil/time.h"
 #include "butil/class_name.h"
 #include "butil/string_printf.h"
+#include "butil/strings/string_util.h"
+#include "butil/debug/leak_annotations.h"
 #include "brpc/log.h"
 #include "brpc/compress.h"
+#include "brpc/checksum.h"
 #include "brpc/policy/nova_pbrpc_protocol.h"
 #include "brpc/global.h"
 #include "brpc/socket_map.h"                   // SocketMapList
@@ -78,6 +81,7 @@
 #include "brpc/details/tcmalloc_extension.h"
 #include "brpc/rdma/rdma_helper.h"
 #include "brpc/baidu_master_service.h"
+#include "brpc/transport_factory.h"
 
 inline std::ostream& operator<<(std::ostream& os, const timeval& tm) {
     const char old_fill = os.fill();
@@ -118,8 +122,6 @@ DEFINE_bool(enable_threads_service, false, "Enable /threads");
 DECLARE_int32(usercode_backup_threads);
 DECLARE_bool(usercode_in_pthread);
 
-const int INITIAL_SERVICE_CAP = 64;
-const int INITIAL_CERT_MAP = 64;
 // NOTE: never make s_ncore extern const whose ctor seq against other
 // compilation units is undefined.
 const int s_ncore = sysconf(_SC_NPROCESSORS_ONLN);
@@ -145,13 +147,15 @@ ServerOptions::ServerOptions()
     , internal_port(-1)
     , has_builtin_services(true)
     , force_ssl(false)
-    , use_rdma(false)
+    , socket_mode(SOCKET_MODE_TCP)
     , baidu_master_service(NULL)
     , http_master_service(NULL)
     , health_reporter(NULL)
     , rtmp_service(NULL)
     , redis_service(NULL)
-    , bthread_tag(BTHREAD_TAG_INVALID) {
+    , bthread_tag(BTHREAD_TAG_DEFAULT)
+    , rpc_pb_message_factory(NULL)
+    , ignore_eovercrowded(false) {
     if (s_ncore > 0) {
         num_threads = s_ncore + 1;
     }
@@ -178,7 +182,8 @@ Server::MethodProperty::MethodProperty()
     , http_url(NULL)
     , service(NULL)
     , method(NULL)
-    , status(NULL) {
+    , status(NULL)
+    , ignore_eovercrowded(false) {
 }
 
 static timeval GetUptime(void* arg/*start_time*/) {
@@ -225,6 +230,17 @@ static void PrintSupportedCompressions(std::ostream& os, void*) {
     }
 }
 
+static void PrintSupportedChecksums(std::ostream& os, void*) {
+    std::vector<ChecksumHandler> handlers;
+    ListChecksumHandler(&handlers);
+    for (size_t i = 0; i < handlers.size(); ++i) {
+        if (i != 0) {
+            os << ' ';
+        }
+        os << (handlers[i].name ? handlers[i].name : "(null)");
+    }
+}
+
 static void PrintEnabledProfilers(std::ostream& os, void*) {
     if (cpu_profiler_enabled) {
         os << "cpu ";
@@ -250,6 +266,9 @@ static bvar::PassiveStatus<std::string> s_proto_st(
 
 static bvar::PassiveStatus<std::string> s_comp_st(
     "rpc_compressions", PrintSupportedCompressions, NULL);
+
+static bvar::PassiveStatus<std::string> s_cksum_st(
+    "rpc_checksums", PrintSupportedChecksums, NULL);
 
 static bvar::PassiveStatus<std::string> s_prof_st(
     "rpc_profilers", PrintEnabledProfilers, NULL);
@@ -394,9 +413,9 @@ void* Server::UpdateDerivedVars(void* arg) {
     }
 }
 
-const std::string& Server::ServiceProperty::service_name() const {
+const std::string Server::ServiceProperty::service_name() const {
     if (service) {
-        return service->GetDescriptor()->full_name();
+        return butil::EnsureString(service->GetDescriptor()->full_name());
     } else if (restful_map) {
         return restful_map->service_name();
     }
@@ -410,6 +429,7 @@ Server::Server(ProfilerLinker)
     , _builtin_service_count(0)
     , _virtual_service_count(0)
     , _failed_to_set_max_concurrency_of_method(false)
+    , _failed_to_set_ignore_eovercrowded(false)
     , _am(NULL)
     , _internal_am(NULL)
     , _first_service(NULL)
@@ -421,7 +441,7 @@ Server::Server(ProfilerLinker)
     , _eps_bvar(&_nerror_bvar)
     , _concurrency(0)
     , _concurrency_bvar(cast_no_barrier_int, &_concurrency)
-    ,_has_progressive_read_method(false) {
+    , _has_progressive_read_method(false) {
     BAIDU_CASSERT(offsetof(Server, _concurrency) % 64 == 0,
                   Server_concurrency_must_be_aligned_by_cacheline);
 }
@@ -431,7 +451,6 @@ Server::~Server() {
     Join();
     ClearServices();
     FreeSSLContexts();
-
     delete _session_local_data_pool;
     _session_local_data_pool = NULL;
 
@@ -448,6 +467,9 @@ Server::~Server() {
 
     delete _options.http_master_service;
     _options.http_master_service = NULL;
+
+    delete _options.rpc_pb_message_factory;
+    _options.rpc_pb_message_factory = NULL;
 
     delete _am;
     _am = NULL;
@@ -657,22 +679,6 @@ int Server::InitializeOnce() {
     if (_status != UNINITIALIZED) {
         return 0;
     }
-    if (_fullname_service_map.init(INITIAL_SERVICE_CAP) != 0) {
-        LOG(ERROR) << "Fail to init _fullname_service_map";
-        return -1;
-    }
-    if (_service_map.init(INITIAL_SERVICE_CAP) != 0) {
-        LOG(ERROR) << "Fail to init _service_map";
-        return -1;
-    }
-    if (_method_map.init(INITIAL_SERVICE_CAP * 2) != 0) {
-        LOG(ERROR) << "Fail to init _method_map";
-        return -1;
-    }
-    if (_ssl_ctx_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _ssl_ctx_map";
-        return -1;
-    }
     _status = READY;
     return 0;
 }
@@ -748,7 +754,7 @@ static int get_port_from_fd(int fd) {
 
 bool Server::CreateConcurrencyLimiter(const AdaptiveMaxConcurrency& amc,
                                       ConcurrencyLimiter** out) {
-    if (amc.type() == AdaptiveMaxConcurrency::UNLIMITED()) {
+    if (amc.type() == AdaptiveMaxConcurrency::UNLIMITED) {
         *out = NULL;
         return true;
     }
@@ -767,29 +773,55 @@ bool Server::CreateConcurrencyLimiter(const AdaptiveMaxConcurrency& amc,
     return true;
 }
 
-#if BRPC_WITH_RDMA
-static bool OptionsAvailableOverRdma(const ServerOptions* opt) {
-    if (opt->rtmp_service) {
-        LOG(WARNING) << "RTMP is not supported by RDMA";
-        return false;
-    }
-    if (opt->has_ssl_options()) {
-        LOG(WARNING) << "SSL is not supported by RDMA";
-        return false;
-    }
-    if (opt->nshead_service) {
-        LOG(WARNING) << "NSHEAD is not supported by RDMA";
-        return false;
-    }
-    if (opt->mongo_service_adaptor) {
-        LOG(WARNING) << "MONGO is not supported by RDMA";
-        return false;
-    }
-    return true;
-}
-#endif
 
 static AdaptiveMaxConcurrency g_default_max_concurrency_of_method(0);
+static bool g_default_ignore_eovercrowded(false);
+
+inline void copy_and_fill_server_options(ServerOptions& dst, const ServerOptions& src) {
+// follow Server::~Server()
+#define FREE_PTR_IF_NOT_REUSED(ptr)         \
+    if (dst.ptr != src.ptr) {               \
+        delete dst.ptr;                     \
+        dst.ptr = NULL;                     \
+    }
+
+    if (&dst != &src) {
+        FREE_PTR_IF_NOT_REUSED(nshead_service);
+
+ #ifdef ENABLE_THRIFT_FRAMED_PROTOCOL
+        FREE_PTR_IF_NOT_REUSED(thrift_service);
+ #endif
+
+        FREE_PTR_IF_NOT_REUSED(baidu_master_service);
+        FREE_PTR_IF_NOT_REUSED(http_master_service);
+        FREE_PTR_IF_NOT_REUSED(rpc_pb_message_factory);
+
+        if (dst.pid_file != src.pid_file && !dst.pid_file.empty()) {
+            unlink(dst.pid_file.c_str());
+        }
+
+        if (dst.server_owns_auth) {
+            FREE_PTR_IF_NOT_REUSED(auth);
+        }
+
+        if (dst.server_owns_interceptor) {
+            FREE_PTR_IF_NOT_REUSED(interceptor);
+        }
+
+        FREE_PTR_IF_NOT_REUSED(redis_service);
+
+        // copy data members directly
+        dst = src;
+    }
+#undef FREE_PTR_IF_NOT_REUSED
+
+    // Create the resource if:
+    //   1. `dst` copied from user and user forgot to create
+    //   2. `dst` created by our
+    if (!dst.rpc_pb_message_factory) {
+        dst.rpc_pb_message_factory = new DefaultRpcPBMessageFactory();
+    }
+}
 
 int Server::StartInternal(const butil::EndPoint& endpoint,
                           const PortRange& port_range,
@@ -798,6 +830,12 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
     if (_failed_to_set_max_concurrency_of_method) {
         _failed_to_set_max_concurrency_of_method = false;
         LOG(ERROR) << "previous call to MaxConcurrencyOf() was failed, "
+            "fix it before starting server";
+        return -1;
+    }
+    if (_failed_to_set_ignore_eovercrowded) {
+        _failed_to_set_ignore_eovercrowded = false;
+        LOG(ERROR) << "previous call to IgnoreEovercrowdedOf() was failed, "
             "fix it before starting server";
         return -1;
     }
@@ -816,39 +854,24 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         }
         return -1;
     }
-    if (opt) {
-        _options = *opt;
-    } else {
-        // Always reset to default options explicitly since `_options'
-        // may be the options for the last run or even bad options
-        _options = ServerOptions();
-    }
+
+    copy_and_fill_server_options(_options, opt ? *opt : ServerOptions());
 
     if (!_options.h2_settings.IsValid(true/*log_error*/)) {
         LOG(ERROR) << "Invalid h2_settings";
         return -1;
     }
 
-    if (_options.use_rdma) {
-#if BRPC_WITH_RDMA
-        if (!OptionsAvailableOverRdma(&_options)) {
-            return -1;
-        }
-        rdma::GlobalRdmaInitializeOrDie();
-#else
-        LOG(WARNING) << "Cannot use rdma since brpc does not compile with rdma";
-        return -1;
-#endif
-    }
-
-    auto original_bthread_tag = _options.bthread_tag;
-    if (original_bthread_tag == BTHREAD_TAG_INVALID) {
-        _options.bthread_tag = BTHREAD_TAG_DEFAULT;
-    }
     if (_options.bthread_tag < BTHREAD_TAG_DEFAULT ||
         _options.bthread_tag >= FLAGS_task_group_ntags) {
-        LOG(ERROR) << "Fail to set tag " << _options.bthread_tag << ", tag range is ["
-                   << BTHREAD_TAG_DEFAULT << ":" << FLAGS_task_group_ntags << ")";
+        LOG(ERROR) << "Fail to set tag " << _options.bthread_tag
+                   << ", tag range is [" << BTHREAD_TAG_DEFAULT << ":"
+                   << FLAGS_task_group_ntags << ")";
+        return -1;
+    }
+    int ret = TransportFactory::ContextInitOrDie(_options.socket_mode, true, &_options);
+    if (ret != 0) {
+        LOG(ERROR) << "Fail to initialize transport context for server, ret=" << ret;
         return -1;
     }
 
@@ -893,6 +916,10 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         _session_local_data_pool->Reserve(_options.reserved_session_local_data);
     }
 
+    // Leak of `_keytable_pool' and others is by design.
+    // See comments in Server::Join() for details.
+    // Instruct LeakSanitizer to ignore the designated memory leak.
+    ANNOTATE_SCOPED_MEMORY_LEAK;
     // Init _keytable_pool always. If the server was stopped before, the pool
     // should be destroyed in Join().
     _keytable_pool = new bthread_keytable_pool_t;
@@ -1039,11 +1066,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         if (_options.num_threads < BTHREAD_MIN_CONCURRENCY) {
             _options.num_threads = BTHREAD_MIN_CONCURRENCY;
         }
-        if (original_bthread_tag == BTHREAD_TAG_INVALID) {
-            bthread_setconcurrency(_options.num_threads);
-        } else {
-            bthread_setconcurrency_by_tag(_options.num_threads, _options.bthread_tag);
-        }
+        bthread_setconcurrency_by_tag(_options.num_threads, _options.bthread_tag);
     }
 
     for (MethodMap::iterator it = _method_map.begin();
@@ -1052,7 +1075,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
             it->second.status->SetConcurrencyLimiter(NULL);
         } else {
             const AdaptiveMaxConcurrency* amc = &it->second.max_concurrency;
-            if (amc->type() == AdaptiveMaxConcurrency::UNLIMITED()) {
+            if (amc->type() == AdaptiveMaxConcurrency::UNLIMITED) {
                 amc = &_options.method_max_concurrency;
             }
             ConcurrencyLimiter* cl = NULL;
@@ -1061,6 +1084,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
                 return -1;
             }
             it->second.status->SetConcurrencyLimiter(cl);
+            it->second.max_concurrency.SetConcurrencyLimiter(cl);
         }
     }
     if (0 != SetServiceMaxConcurrency(_options.nshead_service)) {
@@ -1116,7 +1140,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
                 LOG(ERROR) << "Fail to build acceptor";
                 return -1;
             }
-            _am->_use_rdma = _options.use_rdma;
+            _am->_socket_mode = _options.socket_mode;
             _am->_bthread_tag = _options.bthread_tag;
         }
         // Set `_status' to RUNNING before accepting connections
@@ -1183,6 +1207,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
     CHECK_EQ(INVALID_BTHREAD, _derivative_thread);
     bthread_attr_t tmp = BTHREAD_ATTR_NORMAL;
     tmp.tag = _options.bthread_tag;
+    bthread_attr_set_name(&tmp, "UpdateDerivedVars");
     if (bthread_start_background(&_derivative_thread, &tmp,
                                  UpdateDerivedVars, this) != 0) {
         LOG(ERROR) << "Fail to create _derivative_thread";
@@ -1385,7 +1410,7 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
         mp.service = service;
         mp.method = md;
         mp.status = new MethodStatus;
-        _method_map[md->full_name()] = mp;
+        _method_map[butil::EnsureString(md->full_name())] = mp;
         if (is_idl_support && sd->name() != sd->full_name()/*has ns*/) {
             MethodProperty mp2 = mp;
             mp2.own_method_status = false;
@@ -1408,8 +1433,8 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
 
     const ServiceProperty ss = {
         is_builtin_service, svc_opt.ownership, service, NULL };
-    _fullname_service_map[sd->full_name()] = ss;
-    _service_map[sd->name()] = ss;
+    _fullname_service_map[butil::EnsureString(sd->full_name())] = ss;
+    _service_map[butil::EnsureString(sd->name())] = ss;
     if (is_builtin_service) {
         ++_builtin_service_count;
     } else {
@@ -1451,7 +1476,7 @@ int Server::AddServiceInternal(google::protobuf::Service* service,
         // handling is not affected.
         for (size_t i = 0; i < mappings.size(); ++i) {
             const std::string full_method_name =
-                sd->full_name() + "." + mappings[i].method_name;
+                butil::EnsureString(sd->full_name()) + "." + mappings[i].method_name;
             MethodProperty* mp = _method_map.seek(full_method_name);
             if (mp == NULL) {
                 LOG(ERROR) << "Unknown method=`" << full_method_name << '\'';
@@ -1676,9 +1701,9 @@ int Server::RemoveService(google::protobuf::Service* service) {
     }
 
     const google::protobuf::ServiceDescriptor* sd = service->GetDescriptor();
-    ServiceProperty* ss = _fullname_service_map.seek(sd->full_name());
+    ServiceProperty* ss = _fullname_service_map.seek(butil::EnsureString(sd->full_name()));
     if (ss == NULL) {
-        RPC_VLOG << "Fail to find service=" << sd->full_name().c_str();
+        RPC_VLOG << "Fail to find service=" << sd->full_name();
         return -1;
     }
     RemoveMethodsOf(service);
@@ -1937,7 +1962,7 @@ bool IsDummyServerRunning() {
 }
 
 const Server::MethodProperty*
-Server::FindMethodPropertyByFullName(const butil::StringPiece&fullname) const  {
+Server::FindMethodPropertyByFullName(const butil::StringPiece& fullname) const  {
     return _method_map.seek(fullname);
 }
 
@@ -2024,17 +2049,6 @@ int Server::AddCertificate(const CertInfo& cert) {
 }
 
 bool Server::AddCertMapping(CertMaps& bg, const SSLContext& ssl_ctx) {
-    if (!bg.cert_map.initialized()
-        && bg.cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _cert_map";
-        return false;
-    }
-    if (!bg.wildcard_cert_map.initialized()
-        && bg.wildcard_cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _wildcard_cert_map";
-        return false;
-    }
-
     for (size_t i = 0; i < ssl_ctx.filters.size(); ++i) {
         const char* hostname = ssl_ctx.filters[i].c_str();
         CertMap* cmap = NULL;
@@ -2105,8 +2119,8 @@ int Server::ResetCertificates(const std::vector<CertInfo>& certs) {
     }
 
     SSLContextMap tmp_map;
-    if (tmp_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to initialize tmp_map";
+    if (tmp_map.init(certs.size() + 1) != 0) {
+        LOG(ERROR) << "Fail to init tmp_map";
         return -1;
     }
 
@@ -2150,16 +2164,6 @@ int Server::ResetCertificates(const std::vector<CertInfo>& certs) {
 }
 
 bool Server::ResetCertMappings(CertMaps& bg, const SSLContextMap& ctx_map) {
-    if (!bg.cert_map.initialized()
-        && bg.cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _cert_map";
-        return false;
-    }
-    if (!bg.wildcard_cert_map.initialized()
-        && bg.wildcard_cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _wildcard_cert_map";
-        return false;
-    }
     bg.cert_map.clear();
     bg.wildcard_cert_map.clear();
 
@@ -2208,10 +2212,6 @@ int Server::ResetMaxConcurrency(int max_concurrency) {
 }
 
 AdaptiveMaxConcurrency& Server::MaxConcurrencyOf(MethodProperty* mp) {
-    if (IsRunning()) {
-        LOG(WARNING) << "MaxConcurrencyOf is only allowed before Server started";
-        return g_default_max_concurrency_of_method;
-    }
     if (mp->status == NULL) {
         LOG(ERROR) << "method=" << mp->method->full_name()
                    << " does not support max_concurrency";
@@ -2222,10 +2222,6 @@ AdaptiveMaxConcurrency& Server::MaxConcurrencyOf(MethodProperty* mp) {
 }
 
 int Server::MaxConcurrencyOf(const MethodProperty* mp) const {
-    if (IsRunning()) {
-        LOG(WARNING) << "MaxConcurrencyOf is only allowed before Server started";
-        return g_default_max_concurrency_of_method;
-    }
     if (mp == NULL || mp->status == NULL) {
         return 0;
     }
@@ -2299,6 +2295,38 @@ AdaptiveMaxConcurrency& Server::MaxConcurrencyOf(google::protobuf::Service* serv
 int Server::MaxConcurrencyOf(google::protobuf::Service* service,
                              const butil::StringPiece& method_name) const {
     return MaxConcurrencyOf(service->GetDescriptor()->full_name(), method_name);
+}
+
+bool& Server::IgnoreEovercrowdedOf(const butil::StringPiece& full_method_name) {
+    MethodProperty* mp = _method_map.seek(full_method_name);
+    if (mp == NULL) {
+        LOG(ERROR) << "Fail to find method=" << full_method_name;
+        _failed_to_set_ignore_eovercrowded = true;
+        return g_default_ignore_eovercrowded;
+    }
+    if (IsRunning()) {
+        LOG(WARNING) << "IgnoreEovercrowdedOf is only allowd before Server started";
+        return g_default_ignore_eovercrowded;
+    }
+    if (mp->status == NULL) {
+        LOG(ERROR) << "method=" << mp->method->full_name()
+                   << " does not support ignore_eovercrowded";
+        _failed_to_set_ignore_eovercrowded = true;
+        return g_default_ignore_eovercrowded;
+    }
+    return mp->ignore_eovercrowded;
+}
+
+bool Server::IgnoreEovercrowdedOf(const butil::StringPiece& full_method_name) const {
+    MethodProperty* mp = _method_map.seek(full_method_name);
+    if (IsRunning()) {
+        LOG(WARNING) << "IgnoreEovercrowdedOf is only allowd before Server started";
+        return g_default_ignore_eovercrowded;
+    }
+    if (mp == NULL || mp->status == NULL) {
+        return false;
+    }
+    return mp->ignore_eovercrowded;
 }
 
 bool Server::AcceptRequest(Controller* cntl) const {

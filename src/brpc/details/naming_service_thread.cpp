@@ -125,8 +125,8 @@ void NamingServiceThread::Actions::ResetServers(
         //       Socket. SocketMapKey may be passed through AddWatcher. Make sure
         //       to pick those Sockets with the right settings during OnAddedServers
         const SocketMapKey key(_added[i], _owner->_options.channel_signature);
-        CHECK_EQ(0, SocketMapInsert(key, &tagged_id.id, _owner->_options.ssl_ctx,
-                                    _owner->_options.use_rdma));
+        CHECK_EQ(0, SocketMapInsert(key, &tagged_id.id,
+                                    _owner->_options.socket_option));
         _added_sockets.push_back(tagged_id);
     }
 
@@ -441,9 +441,7 @@ int GetNamingServiceThread(
                 return -1;
             }
             if (g_nsthread_map->init(64) != 0) {
-                mu.unlock();
-                LOG(ERROR) << "Fail to init g_nsthread_map";
-                return -1;
+                LOG(WARNING) << "Fail to init g_nsthread_map";
             }
         }
         NamingServiceThread*& ptr = (*g_nsthread_map)[key];

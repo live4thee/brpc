@@ -44,6 +44,8 @@
 #include "brpc/interceptor.h"
 #include "brpc/concurrency_limiter.h"
 #include "brpc/baidu_master_service.h"
+#include "brpc/rpc_pb_message_factory.h"
+#include "brpc/socket_mode.h"
 
 namespace brpc {
 
@@ -222,9 +224,9 @@ struct ServerOptions {
     // Force ssl for all connections of the port to Start().
     bool force_ssl;
 
-    // Whether the server uses rdma or not
-    // Default: false
-    bool use_rdma;
+    // the server socket mode uses tcp or rdma or other
+    // Default: SOCKET_MODE_TCP
+    SocketMode socket_mode;
 
     // [CAUTION] This option is for implementing specialized baidu-std proxies,
     // most users don't need it. Don't change this option unless you fully
@@ -276,6 +278,20 @@ struct ServerOptions {
     // Server will run in this tagged bthread worker group
     // Default: BTHREAD_TAG_DEFAULT
     bthread_tag_t bthread_tag;
+
+    // [CAUTION] This option is for implementing specialized rpc protobuf
+    // message factory, most users don't need it. Don't change this option
+    // unless you fully understand the description below.
+    // If this option is set, all baidu-std rpc request message and response
+    // message will be created by this factory.
+    //
+    // Owned by Server and deleted in server's destructor.
+    RpcPBMessageFactory* rpc_pb_message_factory;
+
+    // Ignore eovercrowded error on server side, i.e. , if eovercrowded is reported when server is processing a rpc request,
+    // server will keep processing this request, it is expected to be used by some light-weight control-frame rpcs.
+    // [CUATION] You should not enabling this option if your rpc is heavy-loaded.
+    bool ignore_eovercrowded;
 
 private:
     // SSLOptions is large and not often used, allocate it on heap to
@@ -376,7 +392,7 @@ public:
             return !is_builtin_service && !restful_map;
         }
 
-        const std::string& service_name() const;
+        const std::string service_name() const;
     };
     typedef butil::FlatMap<std::string, ServiceProperty> ServiceMap;
 
@@ -402,6 +418,12 @@ public:
         const google::protobuf::MethodDescriptor* method;
         MethodStatus* status;
         AdaptiveMaxConcurrency max_concurrency;
+        // ignore_eovercrowded on method-level, it should be used with carefulness. 
+        // It might introduce inbalance between methods, 
+        // as some methods(ignore_eovercrowded=true) might never return eovercrowded 
+        // while other methods(ignore_eovercrowded=false) keep returning eovercrowded.
+        // currently only valid for baidu_master_service, baidu_rpc, http_rpc, hulu_pbrpc and sofa_pbrpc protocols 
+        bool ignore_eovercrowded;
 
         MethodProperty();
     };
@@ -580,6 +602,9 @@ public:
     int MaxConcurrencyOf(google::protobuf::Service* service,
                          const butil::StringPiece& method_name) const;
 
+    bool& IgnoreEovercrowdedOf(const butil::StringPiece& full_method_name);
+    bool IgnoreEovercrowdedOf(const butil::StringPiece& full_method_name) const;
+
     int Concurrency() const {
         return butil::subtle::NoBarrier_Load(&_concurrency);
     };
@@ -690,9 +715,9 @@ friend class Controller;
 
     template <typename T>
     int SetServiceMaxConcurrency(T* service) {
-        if (NULL != service) {
+        if (NULL != service && NULL != service->_status) {
             const AdaptiveMaxConcurrency* amc = &service->_max_concurrency;
-            if (amc->type() == AdaptiveMaxConcurrency::UNLIMITED()) {
+            if (amc->type() == AdaptiveMaxConcurrency::UNLIMITED) {
                 amc = &_options.method_max_concurrency;
             }
             ConcurrencyLimiter* cl = NULL;
@@ -716,6 +741,7 @@ friend class Controller;
     // number of the virtual services for mapping URL to methods.
     int _virtual_service_count;
     bool _failed_to_set_max_concurrency_of_method;
+    bool _failed_to_set_ignore_eovercrowded;
     Acceptor* _am;
     Acceptor* _internal_am;
 

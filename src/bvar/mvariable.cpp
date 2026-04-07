@@ -24,20 +24,15 @@
 #include "butil/containers/flat_map.h"           // butil::FlatMap
 #include "butil/scoped_lock.h"                   // BAIDU_SCOPE_LOCK
 #include "butil/file_util.h"                     // butil::FilePath
+#include "butil/reloadable_flags.h"
 #include "bvar/variable.h"
 #include "bvar/mvariable.h"
 
 namespace bvar {
 
-constexpr uint64_t MAX_LABELS_COUNT = 10;
-
 DECLARE_bool(bvar_abort_on_same_name);
 
 extern bool s_bvar_may_abort;
-
-DEFINE_int32(bvar_max_multi_dimension_metric_number, 1024, "Max number of multi dimension");
-DEFINE_int32(bvar_max_dump_multi_dimension_metric_number, 1024,
-    "Max number of multi dimension metric number to dump by prometheus rpc service");
 
 static bool validator_bvar_max_multi_dimension_metric_number(const char*, int32_t v) {
     if (v < 1) {
@@ -47,6 +42,10 @@ static bool validator_bvar_max_multi_dimension_metric_number(const char*, int32_
     return true;
 }
 
+DEFINE_int32(bvar_max_multi_dimension_metric_number, 1024, "Max number of multi dimension");
+BUTIL_VALIDATE_GFLAG(bvar_max_multi_dimension_metric_number,
+                     validator_bvar_max_multi_dimension_metric_number);
+
 static bool validator_bvar_max_dump_multi_dimension_metric_number(const char*, int32_t v) {
     if (v < 0) {
         LOG(ERROR) << "Invalid bvar_max_dump_multi_dimension_metric_number=" << v;
@@ -54,19 +53,27 @@ static bool validator_bvar_max_dump_multi_dimension_metric_number(const char*, i
     }
     return true;
 }
+DEFINE_int32(bvar_max_dump_multi_dimension_metric_number, 1024,
+             "Max number of multi dimension metric number to dump by prometheus rpc service");
+BUTIL_VALIDATE_GFLAG(bvar_max_dump_multi_dimension_metric_number,
+                     validator_bvar_max_dump_multi_dimension_metric_number);
 
-
-const bool ALLOW_UNUSED dummp_bvar_max_multi_dimension_metric_number = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_max_multi_dimension_metric_number, validator_bvar_max_multi_dimension_metric_number);
-
-const bool ALLOW_UNUSED dummp_bvar_max_dump_multi_dimension_metric_number = ::GFLAGS_NS::RegisterFlagValidator(
-  &FLAGS_bvar_max_dump_multi_dimension_metric_number, validator_bvar_max_dump_multi_dimension_metric_number);
+static bool validator_max_multi_dimension_stats_count(const char*, uint32_t v) {
+    if (v < 1) {
+        LOG(ERROR) << "Invalid max_multi_dimension_stats_count=" << v;
+        return false;
+    }
+    return true;
+}
+DEFINE_uint32(max_multi_dimension_stats_count, 20000, "Max stats count of a multi dimension metric.");
+BUTIL_VALIDATE_GFLAG(max_multi_dimension_stats_count,
+                     validator_max_multi_dimension_stats_count);
 
 class MVarEntry {
 public:
     MVarEntry() : var(NULL) {}
 
-    MVariable* var;
+    MVariableBase* var;
 };
 
 typedef butil::FlatMap<std::string, MVarEntry> MVarMap;
@@ -75,7 +82,9 @@ struct MVarMapWithLock : public MVarMap {
     pthread_mutex_t mutex;
 
     MVarMapWithLock() {
-        CHECK_EQ(0, init(256, 80));
+        if (init(256) != 0) {
+            LOG(WARNING) << "Fail to init";
+        }
         pthread_mutex_init(&mutex, NULL);
     }
 };
@@ -96,27 +105,18 @@ inline MVarMapWithLock& get_mvar_map() {
     return *s_mvar_map;
 }
 
-MVariable::MVariable(const std::list<std::string>& labels) {
-    _labels.assign(labels.begin(), labels.end());
-    size_t n = labels.size();
-    if (n > MAX_LABELS_COUNT) {
-        LOG(ERROR) << "Too many labels: " << n << " seen, overflow detected, max labels count: " << MAX_LABELS_COUNT;
-        _labels.resize(MAX_LABELS_COUNT);
-    }
+MVariableBase::~MVariableBase() {
+    CHECK(!hide()) << "Subclass of MVariableBase MUST call hide() manually in their "
+                      "dtors to avoid displaying a variable that is just destructing";
 }
 
-MVariable::~MVariable() {
-    CHECK(!hide()) << "Subclass of MVariable MUST call hide() manually in their"
-    " dtors to avoid displaying a variable that is just destructing";
-}
-
-std::string MVariable::get_description() {
+std::string MVariableBase::get_description() {
     std::ostringstream os;
     describe(os);
     return os.str();
 }
 
-int MVariable::describe_exposed(const std::string& name,
+int MVariableBase::describe_exposed(const std::string& name,
                                 std::ostream& os) {
     MVarMapWithLock& m = get_mvar_map();
     BAIDU_SCOPED_LOCK(m.mutex);
@@ -128,7 +128,7 @@ int MVariable::describe_exposed(const std::string& name,
     return 0;
 }
 
-std::string MVariable::describe_exposed(const std::string& name) {
+std::string MVariableBase::describe_exposed(const std::string& name) {
     std::ostringstream oss;
     if (describe_exposed(name, oss) == 0) {
         return oss.str();
@@ -136,8 +136,8 @@ std::string MVariable::describe_exposed(const std::string& name) {
     return std::string();
 }
 
-int MVariable::expose_impl(const butil::StringPiece& prefix,
-                           const butil::StringPiece& name) {
+int MVariableBase::expose_impl(const butil::StringPiece& prefix,
+                               const butil::StringPiece& name) {
     if (name.empty()) {
         LOG(ERROR) << "Parameter[name] is empty";
         return -1;
@@ -194,7 +194,7 @@ int MVariable::expose_impl(const butil::StringPiece& prefix,
     return 0;
 }
 
-bool MVariable::hide() {
+bool MVariableBase::hide() {
     if (_name.empty()) {
         return false;
     }
@@ -212,20 +212,20 @@ bool MVariable::hide() {
 }
 
 #ifdef UNIT_TEST
-void MVariable::hide_all() {
+void MVariableBase::hide_all() {
     MVarMapWithLock& m = get_mvar_map();
     BAIDU_SCOPED_LOCK(m.mutex);
     m.clear();
 }
 #endif // end UNIT_TEST
 
-size_t MVariable::count_exposed() {
+size_t MVariableBase::count_exposed() {
     MVarMapWithLock& m = get_mvar_map();
     BAIDU_SCOPED_LOCK(m.mutex);
     return m.size();
 }
 
-void MVariable::list_exposed(std::vector<std::string>* names) {
+void MVariableBase::list_exposed(std::vector<std::string>* names) {
     if (names == NULL) {
         return;
     }
@@ -240,7 +240,7 @@ void MVariable::list_exposed(std::vector<std::string>* names) {
     }
 }
 
-size_t MVariable::dump_exposed(Dumper* dumper, const DumpOptions* options) {
+size_t MVariableBase::dump_exposed(Dumper* dumper, const DumpOptions* options) {
     if (NULL == dumper) {
         LOG(ERROR) << "Parameter[dumper] is NULL";
         return -1;
@@ -259,13 +259,11 @@ size_t MVariable::dump_exposed(Dumper* dumper, const DumpOptions* options) {
         if (entry) {
             n += entry->var->dump(dumper, &opt);
         }
-	if (n > static_cast<size_t>(FLAGS_bvar_max_dump_multi_dimension_metric_number)) {
-            LOG(WARNING) << "truncated because of \
-		            exceed max dump multi dimension label number["
-			 << FLAGS_bvar_max_dump_multi_dimension_metric_number
-			 << "]";
+        if (n > static_cast<size_t>(FLAGS_bvar_max_dump_multi_dimension_metric_number)) {
+            LOG(WARNING) << "truncated because of exceed max dump multi dimension label number["
+                         << FLAGS_bvar_max_dump_multi_dimension_metric_number << "]";
             break;
-	}
+        }
     }
     return n;
 }

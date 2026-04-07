@@ -19,6 +19,10 @@
 
 // Date: Tue Jul 10 17:40:58 CST 2012
 
+#include <pthread.h>
+#include <set>
+#include <regex>
+#include <sys/syscall.h>                   // SYS_gettid
 #include "butil/scoped_lock.h"             // BAIDU_SCOPED_LOCK
 #include "butil/errno.h"                   // berror
 #include "butil/logging.h"
@@ -32,19 +36,31 @@
 #include "bthread/timer_thread.h"         // global_timer_thread
 #include <gflags/gflags.h>
 #include "bthread/log.h"
+#if defined(OS_MACOSX)
+#include <mach/mach.h>
+#endif
 
 DEFINE_int32(task_group_delete_delay, 1,
              "delay deletion of TaskGroup for so many seconds");
 DEFINE_int32(task_group_runqueue_capacity, 4096,
              "capacity of runqueue in each TaskGroup");
-DEFINE_int32(task_group_yield_before_idle, 0,
-             "TaskGroup yields so many times before idle");
 DEFINE_int32(task_group_ntags, 1, "TaskGroup will be grouped by number ntags");
+DEFINE_bool(task_group_set_worker_name, true,
+            "Whether to set the name of the worker thread");
+DEFINE_string(cpu_set, "",
+              "Set of CPUs to which cores are bound. "
+              "for example, 0-3,5,7; default: disable");
 
 namespace bthread {
 
+DEFINE_bool(parking_lot_no_signal_when_no_waiter, false,
+            "ParkingLot doesn't signal when there is no waiter. "
+            "In busy worker scenarios, signal overhead can be reduced.");
+DEFINE_bool(enable_bthread_priority_queue, false, "Whether to enable priority queue");
+
 DECLARE_int32(bthread_concurrency);
 DECLARE_int32(bthread_min_concurrency);
+DECLARE_int32(bthread_parking_lot_of_each_tag);
 
 extern pthread_mutex_t g_task_control_mutex;
 extern BAIDU_THREAD_LOCAL TaskGroup* tls_task_group;
@@ -88,14 +104,25 @@ void* TaskControl::worker_thread(void* arg) {
         LOG(ERROR) << "Fail to create TaskGroup in pthread=" << pthread_self();
         return NULL;
     }
-    std::string worker_thread_name = butil::string_printf(
-        "brpc_wkr:%d-%d", g->tag(), c->_next_worker_id.fetch_add(1, butil::memory_order_relaxed));
-    butil::PlatformThread::SetName(worker_thread_name.c_str());
-    BT_VLOG << "Created worker=" << pthread_self() << " bthread=" << g->main_tid()
-            << " tag=" << g->tag();
+
+    g->_tid = pthread_self();
+
+    int worker_id = c->_next_worker_id.fetch_add(
+                        1, butil::memory_order_relaxed);
+    if (!c->_cpus.empty()) {
+        bind_thread_to_cpu(pthread_self(), c->_cpus[worker_id % c->_cpus.size()]);
+    }
+    if (FLAGS_task_group_set_worker_name) {
+        std::string worker_thread_name = butil::string_printf(
+            "brpc_wkr:%d-%d", g->tag(), worker_id);
+        butil::PlatformThread::SetNameSimple(worker_thread_name.c_str());
+    }
+    BT_VLOG << "Created worker=" << pthread_self() << " tid=" << g->_tid
+            << " bthread=" << g->main_tid() << " tag=" << g->tag();
     tls_task_group = g;
     c->_nworkers << 1;
     c->tag_nworkers(g->tag()) << 1;
+
     g->run_main_task();
 
     stat = g->main_stat();
@@ -146,7 +173,7 @@ static double get_cumulated_worker_time_from_this_with_tag(void* arg) {
     auto a = static_cast<CumulatedWithTagArgs*>(arg);
     auto c = a->c;
     auto t = a->t;
-    return c->get_cumulated_worker_time_with_tag(t);
+    return c->get_cumulated_worker_time(t);
 }
 
 static int64_t get_cumulated_switch_count_from_this(void *arg) {
@@ -177,7 +204,10 @@ TaskControl::TaskControl()
     , _signal_per_second(&_cumulated_signal_count)
     , _status(print_rq_sizes_in_the_tc, this)
     , _nbthreads("bthread_count")
-    , _pl(FLAGS_task_group_ntags)
+    , _enable_priority_queue(FLAGS_enable_bthread_priority_queue)
+    , _priority_queues(FLAGS_task_group_ntags)
+    , _pl_num_of_each_tag(FLAGS_bthread_parking_lot_of_each_tag)
+    , _tagged_pl(FLAGS_task_group_ntags)
 {}
 
 int TaskControl::init(int concurrency) {
@@ -191,6 +221,13 @@ int TaskControl::init(int concurrency) {
     }
     _concurrency = concurrency;
 
+    if (!FLAGS_cpu_set.empty()) {
+        if (parse_cpuset(FLAGS_cpu_set, _cpus) == -1) {
+            LOG(ERROR) << "invalid cpuset=" << FLAGS_cpu_set;
+            return -1;
+        }
+    }
+
     // task group group by tags
     for (int i = 0; i < FLAGS_task_group_ntags; ++i) {
         _tagged_ngroup[i].store(0, std::memory_order_relaxed);
@@ -201,6 +238,10 @@ int TaskControl::init(int concurrency) {
         _tagged_worker_usage_second.push_back(new bvar::PerSecond<bvar::PassiveStatus<double>>(
             "bthread_worker_usage", tag_str, _tagged_cumulated_worker_time[i], 1));
         _tagged_nbthreads.push_back(new bvar::Adder<int64_t>("bthread_count", tag_str));
+        if (_priority_queues[i].init(BTHREAD_MAX_CONCURRENCY) != 0) {
+            LOG(ERROR) << "Fail to init _priority_q";
+            return -1;
+        }
     }
 
     // Make sure TimerThread is ready.
@@ -208,6 +249,13 @@ int TaskControl::init(int concurrency) {
         LOG(ERROR) << "Fail to get global_timer_thread";
         return -1;
     }
+
+#ifdef BRPC_BTHREAD_TRACER
+    if (!_task_tracer.Init()) {
+        LOG(ERROR) << "Fail to init TaskTracer";
+        return -1;
+    }
+#endif // BRPC_BTHREAD_TRACER
     
     _workers.resize(_concurrency);   
     for (int i = 0; i < _concurrency; ++i) {
@@ -215,7 +263,7 @@ int TaskControl::init(int concurrency) {
         const int rc = pthread_create(&_workers[i], NULL, worker_thread, arg);
         if (rc) {
             delete arg;
-            LOG(ERROR) << "Fail to create _workers[" << i << "], " << berror(rc);
+            PLOG(ERROR) << "Fail to create _workers[" << i << "]";
             return -1;
         }
     }
@@ -259,8 +307,7 @@ int TaskControl::add_workers(int num, bthread_tag_t tag) {
                 &_workers[i + old_concurency], NULL, worker_thread, arg);
         if (rc) {
             delete arg;
-            LOG(WARNING) << "Fail to create _workers[" << i + old_concurency
-                         << "], " << berror(rc);
+            PLOG(WARNING) << "Fail to create _workers[" << i + old_concurency << "]";
             _concurrency.fetch_sub(1, butil::memory_order_release);
             break;
         }
@@ -281,6 +328,80 @@ TaskGroup* TaskControl::choose_one_group(bthread_tag_t tag) {
     return NULL;
 }
 
+int TaskControl::parse_cpuset(std::string value, std::vector<unsigned>& cpus) {
+    static std::regex r("(\\d+-)?(\\d+)(,(\\d+-)?(\\d+))*");
+    std::smatch match;
+    std::set<unsigned> cpuset;
+    if (value.empty()) {
+        return -1;
+    }
+    if (std::regex_match(value, match, r)) {
+        for (butil::StringSplitter split(value.data(), ','); split; ++split) {
+            butil::StringPiece cpu_ids(split.field(), split.length());
+            cpu_ids.trim_spaces();
+            butil::StringPiece begin = cpu_ids;
+            butil::StringPiece end = cpu_ids;
+            auto dash = cpu_ids.find('-');
+            if (dash != cpu_ids.npos) {
+                begin = cpu_ids.substr(0, dash);
+                end = cpu_ids.substr(dash + 1);
+            }
+            unsigned first = UINT_MAX;
+            unsigned last = 0;
+            int ret;
+            ret = butil::StringSplitter(begin, '\t').to_uint(&first);
+            ret = ret | butil::StringSplitter(end, '\t').to_uint(&last);
+            if (ret != 0 || first > last) {
+                return -1;
+            }
+            for (auto i = first; i <= last; ++i) {
+                cpuset.insert(i);
+            }
+        }
+        cpus.assign(cpuset.begin(), cpuset.end());
+        return 0;
+    }
+    return -1;
+}
+
+void TaskControl::bind_thread_to_cpu(pthread_t pthread, unsigned cpu_id) {
+#if defined(OS_LINUX)
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(cpu_id, &cs);
+        auto r = pthread_setaffinity_np(pthread, sizeof(cs), &cs);
+        if (r != 0) {
+            LOG(WARNING) << "Failed to bind thread to cpu: " << cpu_id;
+        }
+        (void)r;
+#elif defined(OS_MACOSX)
+        thread_port_t mach_thread = pthread_mach_thread_np(pthread);
+        if (mach_thread != MACH_PORT_NULL) {
+            LOG(WARNING) << "mach_thread is null"
+                         << "Failed to bind thread to cpu: " << cpu_id;
+            return;
+        }
+        thread_affinity_policy_data_t policy;
+        policy.affinity_tag = cpu_id;
+        if (thread_policy_set(mach_thread,
+                THREAD_AFFINITY_POLICY,
+                (thread_policy_t)&policy,
+                THREAD_AFFINITY_POLICY_COUNT) != KERN_SUCCESS) {
+            LOG(WARNING) << "Failed to bind thread to cpu: " << cpu_id;
+        }
+#endif
+}
+
+#ifdef BRPC_BTHREAD_TRACER
+void TaskControl::stack_trace(std::ostream& os, bthread_t tid) {
+    _task_tracer.Trace(os, tid);
+}
+
+std::string TaskControl::stack_trace(bthread_t tid) {
+    return _task_tracer.Trace(tid);
+}
+#endif // BRPC_BTHREAD_TRACER
+
 extern int stop_and_join_epoll_threads();
 
 void TaskControl::stop_and_join() {
@@ -297,17 +418,22 @@ void TaskControl::stop_and_join() {
             [](butil::atomic<size_t>& index) { index.store(0, butil::memory_order_relaxed); });
     }
     for (int i = 0; i < FLAGS_task_group_ntags; ++i) {
-        for (auto& pl : _pl[i]) {
+        for (auto& pl : _tagged_pl[i]) {
             pl.stop();
         }
     }
-    // Interrupt blocking operations.
-    for (size_t i = 0; i < _workers.size(); ++i) {
-        interrupt_pthread(_workers[i]);
+
+    for (auto worker: _workers) {
+        // Interrupt blocking operations.
+#ifdef BRPC_BTHREAD_TRACER
+        pthread_kill(worker, _task_tracer.get_trace_signal());
+#else
+        interrupt_pthread(worker);
+#endif // BRPC_BTHREAD_TRACER
     }
     // Join workers
-    for (size_t i = 0; i < _workers.size(); ++i) {
-        pthread_join(_workers[i], NULL);
+    for (auto worker : _workers) {
+        pthread_join(worker, NULL);
     }
 }
 
@@ -332,7 +458,7 @@ int TaskControl::_add_group(TaskGroup* g, bthread_tag_t tag) {
         return -1;
     }
     g->set_tag(tag);
-    g->set_pl(&_pl[tag][butil::fmix64(pthread_numeric_id()) % PARKING_LOT_NUM]);
+    g->set_pl(&_tagged_pl[tag][butil::fmix64(pthread_numeric_id()) % _pl_num_of_each_tag]);
     size_t ngroup = _tagged_ngroup[tag].load(butil::memory_order_relaxed);
     if (ngroup < (size_t)BTHREAD_MAX_CONCURRENCY) {
         _tagged_groups[tag][ngroup] = g;
@@ -401,6 +527,11 @@ int TaskControl::_destroy_group(TaskGroup* g) {
 
 bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
     auto tag = tls_task_group->tag();
+
+    if (_priority_queues[tag].steal(tid)) {
+        return true;
+    }
+
     // 1: Acquiring fence is paired with releasing fence in _add_group to
     // avoid accessing uninitialized slot of _groups.
     const size_t ngroup = tag_ngroup(tag).load(butil::memory_order_acquire/*1*/);
@@ -442,14 +573,11 @@ void TaskControl::signal_task(int num_task, bthread_tag_t tag) {
         num_task = 2;
     }
     auto& pl = tag_pl(tag);
-    int start_index = butil::fmix64(pthread_numeric_id()) % PARKING_LOT_NUM;
-    num_task -= pl[start_index].signal(1);
-    if (num_task > 0) {
-        for (int i = 1; i < PARKING_LOT_NUM && num_task > 0; ++i) {
-            if (++start_index >= PARKING_LOT_NUM) {
-                start_index = 0;
-            }
-            num_task -= pl[start_index].signal(1);
+    size_t start_index = butil::fmix64(pthread_numeric_id()) % _pl_num_of_each_tag;
+    for (size_t i = 0; i < _pl_num_of_each_tag && num_task > 0; ++i) {
+        num_task -= pl[start_index].signal(1);
+        if (++start_index >= _pl_num_of_each_tag) {
+            start_index = 0;
         }
     }
     if (num_task > 0 &&
@@ -488,22 +616,18 @@ double TaskControl::get_cumulated_worker_time() {
     int64_t cputime_ns = 0;
     BAIDU_SCOPED_LOCK(_modify_group_mutex);
     for_each_task_group([&](TaskGroup* g) {
-        if (g) {
-            cputime_ns += g->_cumulated_cputime_ns;
-        }
+        cputime_ns += g->cumulated_cputime_ns();
     });
     return cputime_ns / 1000000000.0;
 }
 
-double TaskControl::get_cumulated_worker_time_with_tag(bthread_tag_t tag) {
+double TaskControl::get_cumulated_worker_time(bthread_tag_t tag) {
     int64_t cputime_ns = 0;
     BAIDU_SCOPED_LOCK(_modify_group_mutex);
     const size_t ngroup = tag_ngroup(tag).load(butil::memory_order_relaxed);
     auto& groups = tag_group(tag);
     for (size_t i = 0; i < ngroup; ++i) {
-        if (groups[i]) {
-            cputime_ns += groups[i]->_cumulated_cputime_ns;
-        }
+        cputime_ns += groups[i]->cumulated_cputime_ns();
     }
     return cputime_ns / 1000000000.0;
 }
@@ -544,6 +668,25 @@ bvar::LatencyRecorder* TaskControl::create_exposed_pending_time() {
         pt->expose("bthread_creation");
     }
     return pt;
+}
+
+std::vector<bthread_t> TaskControl::get_living_bthreads() {
+    std::vector<bthread_t> living_bthread_ids;
+    living_bthread_ids.reserve(1024);
+    butil::for_each_resource<TaskMeta>([&living_bthread_ids](TaskMeta* m) {
+        // filter out those bthreads created by bthread_start* functions,
+        // i.e. not those created internally to run main task as they are
+        // opaque to user.
+        if (m && m->fn) {
+            // determine whether the bthread is living by checking version
+            const uint32_t given_ver = get_version(m->tid);
+            BAIDU_SCOPED_LOCK(m->version_lock);
+            if (given_ver == *m->version_butex) {
+                living_bthread_ids.push_back(m->tid);
+            }
+        }
+    });
+    return living_bthread_ids;
 }
 
 }  // namespace bthread

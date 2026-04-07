@@ -22,6 +22,8 @@
 #include <sys/resource.h>                  // getrusage
 #include <dirent.h>                        // dirent
 #include <iomanip>                         // setw
+#include <stdio.h>
+#include <errno.h>
 #if defined(__APPLE__)
 #include <libproc.h>
 #include <sys/resource.h>
@@ -107,7 +109,7 @@ static bool read_proc_status(ProcStat &stat) {
             ",tpgid,flags,pri,nice | tail -n1", (long)pid);
     if (butil::read_command_output(oss, cmdbuf) != 0) {
         LOG(ERROR) << "Fail to read stat";
-        return -1;
+        return false;
     }
     const std::string& result = oss.str();
     if (sscanf(result.c_str(), "%d %d %d %d"
@@ -230,7 +232,7 @@ static bool read_proc_memory(ProcMemory &m) {
     snprintf(cmdbuf, sizeof(cmdbuf), "ps -p %ld -o rss=,vsz=", (long)pid);
     if (butil::read_command_output(oss, cmdbuf) != 0) {
         LOG(ERROR) << "Fail to read memory state";
-        return -1;
+        return false;
     }
     const std::string& result = oss.str();
     if (sscanf(result.c_str(), "%ld %ld", &m.resident, &m.size) != 2) {
@@ -292,7 +294,7 @@ static bool read_load_average(LoadAverage &m) {
     std::ostringstream oss;
     if (butil::read_command_output(oss, "sysctl -n vm.loadavg") != 0) {
         LOG(ERROR) << "Fail to read loadavg";
-        return -1;
+        return false;
     }
     const std::string& result = oss.str();
     if (sscanf(result.c_str(), "{ %lf %lf %lf }",
@@ -430,7 +432,12 @@ static bool read_proc_io(ProcIO* s) {
 #if defined(OS_LINUX)
     butil::ScopedFILE fp("/proc/self/io", "r");
     if (NULL == fp) {
-        PLOG_ONCE(WARNING) << "Fail to open /proc/self/io";
+        static bool ever_printed_io_err = false;
+        if (!ever_printed_io_err) {
+            fprintf(stderr, "WARNING: Fail to open /proc/self/io, errno=%d. "
+                            "I/O related bvars will be unavailable.\n", errno);
+            ever_printed_io_err = true;
+        }
         return false;
     }
     errno = 0;

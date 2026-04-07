@@ -19,25 +19,25 @@
 
 #include <gflags/gflags.h>
 #include "butil/unique_ptr.h"
+#include "butil/reloadable_flags.h"
 #include "bvar/latency_recorder.h"
 
 namespace bvar {
 
-// Reloading following gflags does not change names of the corresponding bvars.
-// Avoid reloading in practice.
-DEFINE_int32(bvar_latency_p1, 80, "First latency percentile");
-DEFINE_int32(bvar_latency_p2, 90, "Second latency percentile");
-DEFINE_int32(bvar_latency_p3, 99, "Third latency percentile");
-
 static bool valid_percentile(const char*, int32_t v) {
     return v > 0 && v < 100;
 }
-const bool ALLOW_UNUSED dummy_bvar_latency_p1 = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_latency_p1, valid_percentile);
-const bool ALLOW_UNUSED dummy_bvar_latency_p2 = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_latency_p2, valid_percentile);
-const bool ALLOW_UNUSED dummy_bvar_latency_p3 = ::GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_bvar_latency_p3, valid_percentile);
+
+// Reloading following gflags does not change names of the corresponding bvars.
+// Avoid reloading in practice.
+DEFINE_int32(bvar_latency_p1, 80, "First latency percentile");
+BUTIL_VALIDATE_GFLAG(bvar_latency_p1, valid_percentile);
+
+DEFINE_int32(bvar_latency_p2, 90, "Second latency percentile");
+BUTIL_VALIDATE_GFLAG(bvar_latency_p2, valid_percentile);
+
+DEFINE_int32(bvar_latency_p3, 99, "Third latency percentile");
+BUTIL_VALIDATE_GFLAG(bvar_latency_p3, valid_percentile);
 
 namespace detail {
 
@@ -99,7 +99,7 @@ static int64_t double_to_random_int(double dval) {
 }
 
 static int64_t get_window_recorder_qps(void* arg) {
-    detail::Sample<Stat> s;
+    Sample<Stat> s;
     static_cast<RecorderWindow*>(arg)->get_span(&s);
     // Use floating point to avoid overflow.
     if (s.time_us <= 0) {
@@ -253,10 +253,12 @@ int LatencyRecorder::expose(const butil::StringPiece& prefix1,
     if (_latency_percentiles.expose_as(prefix, "latency_percentiles", DISPLAY_ON_HTML) != 0) {
         return -1;
     }
-    snprintf(namebuf, sizeof(namebuf), "%d%%,%d%%,%d%%,99.9%%",
-             (int)FLAGS_bvar_latency_p1, (int)FLAGS_bvar_latency_p2,
-             (int)FLAGS_bvar_latency_p3);
-    CHECK_EQ(0, _latency_percentiles.set_vector_names(namebuf));
+    if (FLAGS_save_series) {
+        snprintf(namebuf, sizeof(namebuf), "%d%%,%d%%,%d%%,99.9%%",
+                 (int)FLAGS_bvar_latency_p1, (int)FLAGS_bvar_latency_p2,
+                 (int)FLAGS_bvar_latency_p3);
+        CHECK_EQ(0, _latency_percentiles.set_vector_names(namebuf));
+    }
     return 0;
 }
 

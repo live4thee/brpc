@@ -20,7 +20,10 @@
 #include <google/protobuf/message.h>             // Message
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/io/coded_stream.h>
+
+#include "butil/strings/string_util.h"
 #include "butil/time.h"
+
 #include "brpc/controller.h"                     // Controller
 #include "brpc/socket.h"                         // Socket
 #include "brpc/server.h"                         // Server
@@ -227,7 +230,7 @@ static void SendHuluResponse(int64_t correlation_id,
                              MethodStatus* method_status,
                              int64_t received_us) {
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
+    auto span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
@@ -304,8 +307,15 @@ static void SendHuluResponse(int64_t correlation_id,
     
     // Have the risk of unlimited pending responses, in which case, tell
     // users to set max_concurrency.
+    ResponseWriteInfo args;
     Socket::WriteOptions wopt;
     wopt.ignore_eovercrowded = true;
+    bthread_id_t response_id = INVALID_BTHREAD_ID;
+    if (span) {
+        CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
     if (sock->Write(&res_buf, &wopt) != 0) {
         const int errcode = errno;
         PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -313,9 +323,12 @@ static void SendHuluResponse(int64_t correlation_id,
                         sock->description().c_str());
         return;
     }
+
     if (span) {
+        bthread_id_join(response_id);
+        // Do not care about the result of background writing.
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
+        span->set_sent_us(args.sent_us);
     }
 }
 
@@ -401,7 +414,7 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
         bthread_assign_data((void*)&server->thread_local_options());
     }
 
-    Span* span = NULL;
+    std::shared_ptr<Span> span;
     if (IsTraceable(meta.has_trace_id())) {
         span = Span::CreateServerSpan(
             meta.trace_id(), meta.span_id(), meta.parent_span_id(),
@@ -419,12 +432,6 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
     do {
         if (!server->IsRunning()) {
             cntl->SetFailed(ELOGOFF, "Server is stopping");
-            break;
-        }
-
-        if (socket->is_overcrowded()) {
-            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
-                            butil::endpoint2str(socket->remote_side()).c_str());
             break;
         }
 
@@ -454,20 +461,29 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
             sp->service->CallMethod(sp->method, cntl.get(), &breq, &bres, NULL);
             break;
         }
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !sp->ignore_eovercrowded) {
+            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
+                            butil::endpoint2str(socket->remote_side()).c_str());
+            break;
+        }
+
         // Switch to service-specific error.
         non_service_error.release();
         method_status = sp->status;
+        const google::protobuf::MethodDescriptor* method = sp->method;
+        const std::string method_full_name = butil::EnsureString(method->full_name());
         if (method_status) {
             int rejected_cc = 0;
             if (!method_status->OnRequested(&rejected_cc)) {
                 cntl->SetFailed(ELIMIT, "Rejected by %s's ConcurrencyLimiter, concurrency=%d",
-                                sp->method->full_name().c_str(), rejected_cc);
+                                method_full_name.c_str(), rejected_cc);
                 break;
             }
         }
         
         google::protobuf::Service* svc = sp->service;
-        const google::protobuf::MethodDescriptor* method = sp->method;
         accessor.set_method(method);
 
         if (!server->AcceptRequest(cntl.get())) {
@@ -475,7 +491,7 @@ void ProcessHuluRequest(InputMessageBase* msg_base) {
         }
 
         if (span) {
-            span->ResetServerSpanName(method->full_name());
+            span->ResetServerSpanName(method_full_name);
         }
         const int reqsize = msg->payload.length();
         butil::IOBuf req_buf;
@@ -540,8 +556,8 @@ bool VerifyHuluRequest(const InputMessageBase* msg_base) {
     Socket* socket = msg->socket();
     const Server* server = static_cast<const Server*>(msg->arg());
 
-    HuluRpcRequestMeta meta;
-    if (!ParsePbFromIOBuf(&meta, msg->meta)) {
+    HuluRpcRequestMeta request_meta;
+    if (!ParsePbFromIOBuf(&request_meta, msg->meta)) {
         LOG(WARNING) << "Fail to parse HuluRpcRequestMeta";
         return false;
     }
@@ -549,13 +565,32 @@ bool VerifyHuluRequest(const InputMessageBase* msg_base) {
     if (NULL == auth) {
         // Fast pass (no authentication)
         return true;
-    }    
-    if (auth->VerifyCredential(
-                meta.credential_data(), socket->remote_side(), 
-                socket->mutable_auth_context()) != 0) {
-        return false;
     }
-    return true;
+    if (auth->VerifyCredential(request_meta.credential_data(),
+                               socket->remote_side(),
+                               socket->mutable_auth_context()) == 0) {
+        return true;
+    }
+
+    // Send `ERPCAUTH' to client.
+    HuluRpcResponseMeta response_meta;
+    response_meta.set_correlation_id(request_meta.correlation_id());
+    response_meta.set_error_code(ERPCAUTH);
+    std::string user_error_text = auth->GetUnauthorizedErrorText();
+    response_meta.set_error_text("Fail to authenticate");
+    if (!user_error_text.empty()) {
+        response_meta.mutable_error_text()->append(": ");
+        response_meta.mutable_error_text()->append(user_error_text);
+    }
+    butil::IOBuf res_buf;
+    SerializeHuluHeaderAndMeta(&res_buf, request_meta, 0);
+    Socket::WriteOptions opt;
+    opt.ignore_eovercrowded = true;
+    if (socket->Write(&res_buf, &opt) != 0) {
+        PLOG_IF(WARNING, errno != EPIPE) << "Fail to write into " << *socket;
+    }
+
+    return false;
 }
 
 void ProcessHuluResponse(InputMessageBase* msg_base) {
@@ -577,8 +612,7 @@ void ProcessHuluResponse(InputMessageBase* msg_base) {
     }
     
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.size() + msg->payload.size() + 12);
@@ -680,7 +714,7 @@ void PackHuluRequest(butil::IOBuf* req_buf,
     } // else don't set user_mesage_size when there's no attachment, otherwise
     // existing hulu-pbrpc server may complain about empty attachment.
 
-    Span* span = ControllerPrivateAccessor(cntl).span();
+    auto span = ControllerPrivateAccessor(cntl).span();
     if (span) {
         meta.set_trace_id(span->trace_id());
         meta.set_span_id(span->span_id());

@@ -31,6 +31,7 @@ set(TEST_PROTO_FILES addressbook1.proto
                      snappy_message.proto
                      v1.proto
                      v2.proto
+                     v3.proto
                      grpc.proto
                      health_check.proto)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test/hdrs)
@@ -51,7 +52,7 @@ else()
     message(FATAL_ERROR "Googletest is not available")
 endif()
 
-set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL} -DGFLAGS_NS=${GFLAGS_NS}")
+set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL}")
 set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__=__unused__ -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DUNIT_TEST -Dprivate=public -Dprotected=public -DBVAR_NOT_LINK_DEFAULT_VARIABLES -D__STRICT_ANSI__ -include ${PROJECT_SOURCE_DIR}/test/sstream_workaround.h")
 set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -g -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer")
 use_cxx11()
@@ -173,8 +174,8 @@ SET(TEST_BUTIL_SOURCES
     ${PROJECT_SOURCE_DIR}/test/object_pool_unittest.cpp
     ${PROJECT_SOURCE_DIR}/test/test_switches.cc
     ${PROJECT_SOURCE_DIR}/test/scoped_locale.cc
-    ${PROJECT_SOURCE_DIR}/test/scope_guard_unittest.cc
-    ${PROJECT_SOURCE_DIR}/test/butil_unittest_main.cpp
+    ${PROJECT_SOURCE_DIR}/test/scope_guard_unittest.cpp
+    ${PROJECT_SOURCE_DIR}/test/optional_unittest.cpp
     ${PROJECT_SOURCE_DIR}/test/butil_unittest_main.cpp
 	)
 
@@ -187,10 +188,12 @@ endif()
 # bthread_* functions are used in logging.cc, and they need to be marked as
 # weak symbols explicitly in Darwin system.
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(DYNAMIC_LIB ${DYNAMIC_LIB}
-                    "-Wl,-U,_bthread_getspecific"
-                    "-Wl,-U,_bthread_setspecific"
-                    "-Wl,-U,_bthread_key_create")
+    set(DYNAMIC_LIB ${DYNAMIC_LIB} "-Wl,-U,_bthread_getspecific"
+                                   "-Wl,-U,_bthread_setspecific"
+                                   "-Wl,-U,_bthread_key_create"
+                                   "-Wl,-U,_bthread_self"
+                                   "-Wl,-U,_bthread_timed_connect"
+    )
 endif()
 
 add_library(BUTIL_DEBUG_LIB OBJECT ${BUTIL_SOURCES})
@@ -272,7 +275,10 @@ if(BUILD_FUZZ_TESTS)
     endif()
 
     set(FUZZ_TARGETS fuzz_butil fuzz_esp fuzz_hpack fuzz_http
-        fuzz_hulu fuzz_json fuzz_redis fuzz_shead fuzz_sofa fuzz_uri)
+        fuzz_hulu fuzz_json fuzz_redis fuzz_shead fuzz_sofa fuzz_uri
+        fuzz_baidu_rpc fuzz_mongo fuzz_memcache
+        fuzz_couchbase fuzz_streaming fuzz_http_parser fuzz_amf)
+
 
     foreach(target ${FUZZ_TARGETS})
         add_executable(${target} fuzzing/${target}.cpp $<TARGET_OBJECTS:TEST_PROTO_LIB>)

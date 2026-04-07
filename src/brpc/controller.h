@@ -25,6 +25,7 @@
 #include <functional>                          // std::function
 #include <gflags/gflags.h>                     // Users often need gflags
 #include <string>
+#include <memory>
 #include "butil/intrusive_ptr.hpp"             // butil::intrusive_ptr
 #include "bthread/errno.h"                     // Redefine errno
 #include "butil/endpoint.h"                    // butil::EndPoint
@@ -71,6 +72,7 @@ class RPCSender;
 class StreamSettings;
 class MongoContext;
 class RetryPolicy;
+class BackupRequestPolicy;
 class InputMessageBase;
 class ThriftStub;
 namespace policy {
@@ -122,7 +124,9 @@ friend class schan::Sender;
 friend class schan::SubDone;
 friend class policy::OnServerStreamCreated;
 friend int StreamCreate(StreamId*, Controller&, const StreamOptions*);
+friend int StreamCreate(StreamIds&, int, Controller&, const StreamOptions*);
 friend int StreamAccept(StreamId*, Controller&, const StreamOptions*);
+friend int StreamAccept(StreamIds&, Controller&, const StreamOptions*);
 friend void policy::ProcessMongoRequest(InputMessageBase*);
 friend void policy::ProcessThriftRequest(InputMessageBase*);
     // << Flags >>
@@ -180,7 +184,10 @@ public:
     // Set/get the delay to send backup request in milliseconds. Use
     // ChannelOptions.backup_request_ms on unset.
     void set_backup_request_ms(int64_t timeout_ms);
-    int64_t backup_request_ms() const { return _backup_request_ms; }
+    void set_backup_request_policy(BackupRequestPolicy* policy) {
+        _backup_request_policy = policy;
+    }
+    int64_t backup_request_ms() const;
 
     // Set/get maximum times of retrying. Use ChannelOptions.max_retry on unset.
     // <=0 means no retry.
@@ -235,6 +242,9 @@ public:
     // Set compression method for request.
     void set_request_compress_type(CompressType t) { _request_compress_type = t; }
 
+    // Set checksum type for request.
+    void set_request_checksum_type(ChecksumType t) { _request_checksum_type = t; }
+
     // Required by some load balancers.
     void set_request_code(uint64_t request_code) {
         add_flag(FLAGS_REQUEST_CODE);
@@ -260,7 +270,6 @@ public:
     UserFieldsMap* request_user_fields() {
         if (!_request_user_fields) {
             _request_user_fields = new UserFieldsMap;
-            _request_user_fields->init(29);
         }
         return _request_user_fields;
     }
@@ -270,7 +279,6 @@ public:
     UserFieldsMap* response_user_fields() {
         if (!_response_user_fields) {
             _response_user_fields = new UserFieldsMap;
-            _response_user_fields->init(29);
         }
         return _response_user_fields;
     }
@@ -460,6 +468,9 @@ public:
 
     // Set compression method for response.
     void set_response_compress_type(CompressType t) { _response_compress_type = t; }
+
+    // Set checksum type for response.
+    void set_response_checksum_type(ChecksumType t) { _response_checksum_type = t; }
     
     // Non-zero when this RPC call is traced (by rpcz or rig).
     // NOTE: Only valid at server-side, always zero at client-side.
@@ -548,6 +559,8 @@ public:
     const std::string& request_id() const { return _inheritable.request_id; }
     CompressType request_compress_type() const { return _request_compress_type; }
     CompressType response_compress_type() const { return _response_compress_type; }
+    ChecksumType request_checksum_type() const { return _request_checksum_type; }
+    ChecksumType response_checksum_type() const { return _response_checksum_type; }
     const HttpHeader& http_request() const 
     { return _http_request != NULL ? *_http_request : DefaultHttpHeader(); }
     
@@ -612,6 +625,31 @@ public:
 
     void CallAfterRpcResp(const google::protobuf::Message* req, const google::protobuf::Message* res);
 
+    void set_request_content_type(ContentType type) {
+        _request_content_type = type;
+    }
+    ContentType request_content_type() const {
+        return _request_content_type;
+    }
+
+    void set_response_content_type(ContentType type) {
+        _response_content_type = type;
+    }
+    ContentType response_content_type() const {
+        return _response_content_type;
+    }
+
+    // If brpc acts as a server, this interface exposes the time when the RPC was received from the
+    // socket. This function can be used in scenarios where the user code needs to understand the RPC
+    // reception time, such as for precise control of timeouts. Users will require timing to start
+    // from the receipt of the RPC. When the user processing function starts to handle the RPC, if
+    // it is found that the RPC has timed out, it will be directly discarded
+    void set_rpc_received_us(int64_t received_us) { _rpc_received_us = received_us; }
+
+    // Get the received time of RPC (in microseconds), if the returned value is 0, it means that
+    // the received time of RPC is not recorded in the controller.
+    int64_t get_rpc_received_us() const { return _rpc_received_us; }
+
 private:
     struct CompletionInfo {
         CallId id;           // call_id of the corresponding request
@@ -670,10 +708,12 @@ private:
     struct ClientSettings {
         int32_t timeout_ms;
         int32_t backup_request_ms;
-        int max_retry;                      
+        BackupRequestPolicy* backup_request_policy;
+        int max_retry;
         int32_t tos;
         ConnectionType connection_type;         
         CompressType request_compress_type;
+        ChecksumType request_checksum_type;
         uint64_t log_id;
         bool has_request_code;
         int64_t request_code;
@@ -737,9 +777,7 @@ private:
         _end_time_us = begin_time_us;
     }
 
-    void OnRPCEnd(int64_t end_time_us) {
-        _end_time_us = end_time_us;
-    }
+    void OnRPCEnd(int64_t end_time_us);
 
     static void RunDoneInBackupThread(void*);
     void DoneInBackupThread();
@@ -766,7 +804,7 @@ private:
 private:
     // NOTE: align and group fields to make Controller as compact as possible.
 
-    Span* _span;
+    std::weak_ptr<Span> _span;
     uint32_t _flags; // all boolean fields inside Controller
     int32_t _error_code;
     std::string _error_text;
@@ -800,6 +838,8 @@ private:
     int32_t _timeout_ms;
     int32_t _connect_timeout_ms;
     int32_t _backup_request_ms;
+    // Priority: `_backup_request_policy' > `_backup_request_ms'.
+    BackupRequestPolicy* _backup_request_policy;
     // If this rpc call has retry/backup request,this var save the real timeout for current call
     int64_t _real_timeout_ms;
     // Deadline of this RPC (since the Epoch in microseconds).
@@ -815,6 +855,9 @@ private:
     int _preferred_index;
     CompressType _request_compress_type;
     CompressType _response_compress_type;
+    ChecksumType _request_checksum_type;
+    ChecksumType _response_checksum_type;
+    std::string _checksum_value;
     Inheritable _inheritable;
     int _pchan_sub_count;
     google::protobuf::Message* _response;
@@ -854,6 +897,11 @@ private:
     butil::IOBuf _request_attachment;
     butil::IOBuf _response_attachment;
 
+    // Only SerializedRequest supports `_request_content_type'.
+    ContentType _request_content_type;
+    // Only SerializedResponse supports `_response_content_type'.
+    ContentType _response_content_type;
+
     // Writable progressive attachment
     butil::intrusive_ptr<ProgressiveAttachment> _wpa;
     // Readable progressive attachment
@@ -861,9 +909,9 @@ private:
 
     // TODO: Replace following fields with StreamCreator
     // Defined at client side
-    StreamId _request_stream;
+    StreamIds _request_streams;
     // Defined at server side
-    StreamId _response_stream;
+    StreamIds _response_streams;
     // Defined at both sides
     StreamSettings *_remote_stream_settings;
 
@@ -873,6 +921,9 @@ private:
     uint32_t _auth_flags;
 
     AfterRpcRespFnType _after_rpc_resp_fn;
+
+    // The point in time when the rpc is read from the socket
+    int64_t _rpc_received_us;
 };
 
 // Advises the RPC system that the caller desires that the RPC call be

@@ -22,21 +22,19 @@
 #include <fcntl.h>                     // O_RDONLY
 #include <stdlib.h>
 #include <memory>
+#include <cstring>
 #include <butil/files/temp_file.h>      // TempFile
 #include <butil/containers/flat_map.h>
 #include <butil/macros.h>
 #include <butil/time.h>                 // Timer
 #include <butil/fd_utility.h>           // make_non_blocking
 #include <butil/iobuf.h>
+#include <butil/single_iobuf.h>
 #include <butil/logging.h>
 #include <butil/fd_guard.h>
 #include <butil/errno.h>
 #include <butil/fast_rand.h>
-#if BAZEL_TEST
-#include "test/iobuf.pb.h"
-#else
 #include "iobuf.pb.h"
-#endif   // BAZEL_TEST
 
 namespace butil {
 namespace iobuf {
@@ -295,6 +293,7 @@ TEST_F(IOBufTest, appendv) {
     ASSERT_EQ(0, b.appendv(vec2, arraysize(vec2)));
     ASSERT_EQ(full_len, b.size());
     ASSERT_EQ(0, memcmp(str, b.to_string().data(), full_len));
+    free(str);
 }
 
 TEST_F(IOBufTest, reserve) {
@@ -349,6 +348,8 @@ TEST_F(IOBufTest, reserve) {
     ASSERT_EQ("orang" + s2 + s1, b.to_string());
 }
 
+#ifndef BUTIL_USE_ASAN
+// ASan will detect heap-buffer-overflow error casued by FakeBlock.
 struct FakeBlock {
     int nshared;
     FakeBlock() : nshared(1) {}
@@ -455,6 +456,7 @@ TEST_F(IOBufTest, iobuf_as_queue) {
         delete blocks[i];
     }
 }
+#endif // BUTIL_USE_ASAN
 
 TEST_F(IOBufTest, iobuf_sanity) {
     install_debug_allocator();
@@ -1783,6 +1785,165 @@ TEST_F(IOBufTest, acquire_tls_block) {
     b = butil::iobuf::acquire_tls_block();
     ASSERT_EQ(0, butil::iobuf::get_tls_block_count());
     ASSERT_NE(butil::iobuf::block_cap(b), butil::iobuf::block_size(b));
+}
+
+TEST_F(IOBufTest, reserve_aligned) {
+    {
+        butil::IOReserveAlignedBuf buf(16);
+        auto area = buf.reserve(1024);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 16, 0);
+            ASSERT_EQ(size % 16, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 1024);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(1024);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 4096);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(8191);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 8192);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(4096 * 10 - 1);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 4096 * 10);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4095);
+        auto area = buf.reserve(4096);
+        ASSERT_EQ(area, butil::IOBuf::INVALID_AREA);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(8192);
+        auto area = buf.reserve(4096 * 10 + 1);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int total_size = 0;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 4096 * 10 + 8192);
+    }
+    {
+        butil::IOReserveAlignedBuf buf(4096);
+        auto area = buf.reserve(1024 * 1024 * 3);
+        ASSERT_NE(area, butil::IOBuf::INVALID_AREA);
+        butil::IOBufAsZeroCopyInputStream wrapper(buf);
+        const void* data;
+        int size;
+        int count = 0;
+        int total_size = 0;
+        std::stringstream ss;
+        while (wrapper.Next(&data, &size)) {
+            ASSERT_EQ(reinterpret_cast<uintptr_t>(data) % 4096, 0);
+            ASSERT_EQ(size % 4096, 0);
+            std::string str(size, 'A' + count++);
+            ss << str;
+            std::memcpy(const_cast<void*>(data), str.data(), str.size());
+            total_size += size;
+        }
+        ASSERT_EQ(total_size, 3145728);
+        ASSERT_EQ(ss.str(), buf.to_string());
+    }
+}
+
+TEST_F(IOBufTest, single_iobuf) {
+    butil::IOBuf buf1;
+    // It will be freed by IOBuf.
+    char *usr_str = (char *)malloc(16);
+    memset(usr_str, 0, 16);
+    char src_str[] = "abcdefgh12345678";
+    size_t total_len = sizeof(src_str);
+    strncpy(usr_str, src_str + 8, total_len - 8);
+    buf1.append(src_str, 8);
+    buf1.append_user_data(usr_str, total_len - 8, NULL);
+    ASSERT_EQ(2, buf1.backing_block_num());
+    butil::SingleIOBuf sbuf;
+    ASSERT_EQ(0, sbuf.backing_block_num());
+    sbuf.assign(buf1, total_len);
+    ASSERT_EQ(1, sbuf.backing_block_num());
+    size_t s_len = sbuf.get_length();
+    ASSERT_EQ(s_len, total_len);
+    const char* str = (const char*) sbuf.get_begin();
+    int ret = strcmp(str, src_str);
+    ASSERT_EQ(0, ret);
+    butil::IOBuf buf2;
+    sbuf.append_to(&buf2);
+    ASSERT_EQ(buf2.length(), total_len);
+    butil::SingleIOBuf sbuf2;
+    sbuf2.swap(sbuf);
+    ASSERT_EQ(sbuf.get_length(), 0);
+    ASSERT_EQ(sbuf2.get_length(), total_len);
+    sbuf2.reset();
+    ASSERT_EQ(0, sbuf2.get_length());
+    
+    void* buf = sbuf.allocate(1024);
+    ASSERT_TRUE(NULL != buf);
+    buf = sbuf.reallocate_downward(16384, 0, 0);
+    ASSERT_TRUE(NULL != buf);
+    s_len = sbuf.get_length();
+    ASSERT_EQ(16384, s_len);
+
+    butil::IOBuf::BlockRef ref = sbuf.get_cur_ref();
+    butil::SingleIOBuf sbuf3(ref);
+    s_len = sbuf3.get_length();
+    ASSERT_EQ(16384, s_len);
+    sbuf.deallocate(buf);
+
+    errno = 0;
+    void *null_buf = sbuf3.reallocate_downward(s_len - 1, 0, 0);
+    ASSERT_EQ(null_buf, nullptr);
+
+    uint32_t old_size = sbuf3.get_length();
+    void *p = sbuf3.reallocate_downward(old_size + 16, 0, old_size); 
+    ASSERT_TRUE(p != nullptr);
+    old_size = sbuf3.get_length();
+    p = sbuf3.reallocate_downward(old_size + 16, old_size, 0);
+    ASSERT_TRUE(p != nullptr);
 }
 
 } // namespace

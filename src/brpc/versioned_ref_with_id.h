@@ -102,17 +102,17 @@ typename std::enable_if<butil::is_void<Ret>::value, Ret>::type ReturnEmpty() {}
         template<typename... Args>                                                          \
         typename std::enable_if<decltype(                                                   \
             Test<class_type, Args...>(0))::value, return_type>::type                        \
-        Call(class_type* obj, Args... args) {                                               \
+        Call(class_type* obj, Args&&... args) {                                             \
             BAIDU_CASSERT((butil::is_result_same<                                           \
                               return_type, decltype(&T::func_name), T, Args...>::value),    \
-                          "Params or return type mismatch");                                          \
+                          "Params or return type mismatch");                                \
                 return obj->func_name(std::forward<Args>(args)...);                         \
         }                                                                                   \
                                                                                             \
         template<typename... Args>                                                          \
         typename std::enable_if<!decltype(                                                  \
             Test<class_type, Args...>(0))::value, return_type>::type                        \
-        Call(class_type* obj, Args... args) {                                               \
+        Call(class_type* obj, Args&&...) {                                                  \
             return ReturnEmpty<return_type>();                                              \
         }                                                                                   \
     }
@@ -128,13 +128,13 @@ typename std::enable_if<butil::is_void<Ret>::value, Ret>::type ReturnEmpty() {}
 //
 // CRTP
 // Derived classes implement 6 functions :
-// 1. (required) int OnCreated(Args... args) :
+// 1. (required) int OnCreated(Args&&... args) :
 //   Will be called in Create() to initialize T init when T is created successfully.
 //   If initialization fails, return non-zero. VersionedRefWithId will be `SetFailed'
 //   and Create() returns non-zero.
 // 2. (required) void BeforeRecycled() :
 //   Will be called in Dereference() before T is recycled.
-// 3. (optional) void OnFailed(Args... args) :
+// 3. (optional) void OnFailed(Args&&... args) :
 //   Will be called in SetFailed() when VersionedRefWithId is set failed successfully.
 // 4. (optional) void BeforeAdditionalRefReleased() :
 //   Will be called in ReleaseAdditionalReference() before additional ref is released.
@@ -211,8 +211,8 @@ public:
     // Create a VersionedRefWithId, put the identifier into `id'.
     // `args' will be passed to OnCreated() directly.
     // Returns 0 on success, -1 otherwise.
-    template<typename ... Args>
-    static int Create(VRefId* id, Args... args);
+    template<typename... Args>
+    static int Create(VRefId* id, Args&&... args);
 
     // Place the VersionedRefWithId associated with identifier `id' into
     // unique_ptr `ptr', which will be released automatically when out
@@ -246,10 +246,10 @@ public:
     // This function is lock-free.
     // Returns -1 when the Socket was already SetFailed(), 0 otherwise.
     template<typename... Args>
-    static int SetFailedById(VRefId id, Args... args);
+    static int SetFailedById(VRefId id, Args&&... args);
 
     template<typename... Args>
-    int SetFailed(Args... args);
+    int SetFailed(Args&&... args);
 
     bool Failed() const {
         return VersionOfVRef(_versioned_ref.load(butil::memory_order_relaxed))
@@ -290,7 +290,7 @@ friend void DereferenceVersionedRefWithId<>(T* r);
     }
 
     template<typename... Args>
-    int SetFailedImpl(Args... args);
+    int SetFailedImpl(Args&&... args);
 
     // Release the reference. If no one is addressing this VersionedRefWithId,
     // it will be recycled automatically and T::BeforeRecycled() will be called.
@@ -350,13 +350,13 @@ void DereferenceVersionedRefWithId(T* r) {
 }
 
 template <typename T>
-template<typename ... Args>
-int VersionedRefWithId<T>::Create(VRefId* id, Args... args) {
+template<typename... Args>
+int VersionedRefWithId<T>::Create(VRefId* id, Args&&... args) {
     resource_id_t slot;
     T* const t = butil::get_resource(&slot, Forbidden());
     if (t == NULL) {
         LOG(FATAL) << "Fail to get_resource<"
-                   << butil::class_name_str<T>() << ">";
+                   << butil::class_name<T>() << ">";
         return -1;
     }
     // nref can be non-zero due to concurrent Address().
@@ -458,7 +458,7 @@ void VersionedRefWithId<T>::ReAddress(VersionedRefWithIdUniquePtr<T>* ptr) {
 
 template<typename T>
 template<typename... Args>
-int VersionedRefWithId<T>::SetFailedById(VRefId id, Args... args) {
+int VersionedRefWithId<T>::SetFailedById(VRefId id, Args&&... args) {
     VersionedRefWithIdUniquePtr<T> ptr;
     if (Address(id, &ptr) != 0) {
         return -1;
@@ -468,13 +468,13 @@ int VersionedRefWithId<T>::SetFailedById(VRefId id, Args... args) {
 
 template<typename T>
 template<typename... Args>
-int VersionedRefWithId<T>::SetFailed(Args... args) {
+int VersionedRefWithId<T>::SetFailed(Args&&... args) {
     return SetFailedImpl(std::forward<Args>(args)...);
 }
 
 template<typename T>
 template<typename... Args>
-int VersionedRefWithId<T>::SetFailedImpl(Args... args) {
+int VersionedRefWithId<T>::SetFailedImpl(Args&&... args) {
     const uint32_t id_ver = VersionOfVRefId(_this_id);
     uint64_t vref = _versioned_ref.load(butil::memory_order_relaxed);
     for (;;) {
@@ -504,10 +504,9 @@ int VersionedRefWithId<T>::ReleaseAdditionalReference() {
     do {
         AdditionalRefStatus expect = ADDITIONAL_REF_USING;
         if (_additional_ref_status.compare_exchange_strong(
-            expect, ADDITIONAL_REF_RECYCLED,
-            butil::memory_order_relaxed,
-            butil::memory_order_relaxed)) {
-            BeforeAdditionalRefReleasedWrapper();
+                expect, ADDITIONAL_REF_RECYCLED,
+                butil::memory_order_relaxed,
+                butil::memory_order_relaxed)) {
             WRAPPER_CALL(BeforeAdditionalRefReleased, static_cast<T*>(this));
             return Dereference();
         }
@@ -591,7 +590,7 @@ void VersionedRefWithId<T>::Revive(int32_t at_least_nref) {
 
         int32_t nref = NRefOfVRef(vref);
         if (nref < at_least_nref) {
-            // Set the status to REF_RECYLED since no one uses this socket
+            // Set the status to REF_RECYCLED since no one uses this socket
             _additional_ref_status.store(
                 ADDITIONAL_REF_RECYCLED, butil::memory_order_relaxed);
             CHECK_EQ(1, nref);
@@ -617,10 +616,10 @@ template<typename T>
 std::string VersionedRefWithId<T>::description() const {
     std::string result;
     result.reserve(128);
-    butil::string_appendf(&result, "Socket{id=%" PRIu64, id());
+    butil::string_appendf(&result, "%s{id=%" PRIu64 " ", butil::class_name<T>(), id());
     result.append(WRAPPER_CALL(
         OnDescription, const_cast<T*>(static_cast<const T*>(this))));
-    butil::string_appendf(&result, "} (0x%p)", this);
+    butil::string_appendf(&result, "} (%p)", this);
     return result;
 }
 

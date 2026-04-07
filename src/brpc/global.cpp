@@ -54,11 +54,16 @@
 // Span
 #include "brpc/span.h"
 #include "bthread/unstable.h"
+#include "bthread/bthread.h"
 
 // Compress handlers
 #include "brpc/compress.h"
 #include "brpc/policy/gzip_compress.h"
 #include "brpc/policy/snappy_compress.h"
+
+// Checksum handlers
+#include "brpc/checksum.h"
+#include "brpc/policy/crc32c_checksum.h"
 
 // Protocols
 #include "brpc/protocol.h"
@@ -71,6 +76,7 @@
 #include "brpc/policy/ubrpc2pb_protocol.h"
 #include "brpc/policy/sofa_pbrpc_protocol.h"
 #include "brpc/policy/memcache_binary_protocol.h"
+#include "brpc/policy/couchbase_protocol.h"
 #include "brpc/policy/streaming_rpc_protocol.h"
 #include "brpc/policy/mongo_protocol.h"
 #include "brpc/policy/redis_protocol.h"
@@ -338,8 +344,11 @@ static void GlobalInitializeOrDieImpl() {
     SetLogHandler(&BaiduStreamingLogHandler);
 #endif
 
-    // Set bthread create span function
-    bthread_set_create_span_func(CreateBthreadSpan);
+    if (bthread_set_span_funcs(CreateBthreadSpanAsVoid,
+                                DestroyRpczParentSpan,
+                                EndBthreadSpan) != 0) {
+        LOG(FATAL) << "Failed to register span callbacks to bthread";
+    }
 
     // Setting the variable here does not work, the profiler probably check
     // the variable before main() for only once.
@@ -388,25 +397,29 @@ static void GlobalInitializeOrDieImpl() {
     LoadBalancerExtension()->RegisterOrDie("_dynpart", &g_ext->dynpart_lb);
 
     // Compress Handlers
-    const CompressHandler gzip_compress =
-        { GzipCompress, GzipDecompress, "gzip" };
+    CompressHandler gzip_compress = { GzipCompress, GzipDecompress, "gzip" };
     if (RegisterCompressHandler(COMPRESS_TYPE_GZIP, gzip_compress) != 0) {
         exit(1);
     }
-    const CompressHandler zlib_compress =
-        { ZlibCompress, ZlibDecompress, "zlib" };
+    CompressHandler zlib_compress = { ZlibCompress, ZlibDecompress, "zlib" };
     if (RegisterCompressHandler(COMPRESS_TYPE_ZLIB, zlib_compress) != 0) {
         exit(1);
     }
-    const CompressHandler snappy_compress =
-        { SnappyCompress, SnappyDecompress, "snappy" };
+    CompressHandler snappy_compress = { SnappyCompress, SnappyDecompress, "snappy" };
     if (RegisterCompressHandler(COMPRESS_TYPE_SNAPPY, snappy_compress) != 0) {
+        exit(1);
+    }
+
+    // Checksum Handlers
+    const ChecksumHandler crc32c_checksum = {Crc32cCompute, Crc32cVerify,
+                                             "crc32c"};
+    if (RegisterChecksumHandler(CHECKSUM_TYPE_CRC32C, crc32c_checksum) != 0) {
         exit(1);
     }
 
     // Protocols
     Protocol baidu_protocol = { ParseRpcMessage,
-                                SerializeRequestDefault, PackRpcRequest,
+                                SerializeRpcRequest, PackRpcRequest,
                                 ProcessRpcRequest, ProcessRpcResponse,
                                 VerifyRpcRequest, NULL, NULL,
                                 CONNECTION_TYPE_ALL, "baidu_std" };
@@ -507,6 +520,16 @@ static void GlobalInitializeOrDieImpl() {
                                     NULL, NULL, GetMemcacheMethodName,
                                     CONNECTION_TYPE_ALL, "memcache" };
     if (RegisterProtocol(PROTOCOL_MEMCACHE, mc_binary_protocol) != 0) {
+        exit(1);
+    }
+
+    Protocol couchbase_protocol = { ParseCouchbaseMessage,
+                                    SerializeCouchbaseRequest,
+                                    PackCouchbaseRequest,
+                                    NULL, ProcessCouchbaseResponse,
+                                    NULL, NULL, GetCouchbaseMethodName,
+                                    CONNECTION_TYPE_ALL, "couchbase" };
+    if (RegisterProtocol(PROTOCOL_COUCHBASE, couchbase_protocol) != 0) {
         exit(1);
     }
 
@@ -627,7 +650,9 @@ static void GlobalInitializeOrDieImpl() {
 
     // We never join GlobalUpdate, let it quit with the process.
     bthread_t th;
-    CHECK(bthread_start_background(&th, NULL, GlobalUpdate, NULL) == 0)
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    bthread_attr_set_name(&attr, "GlobalUpdate");
+    CHECK(bthread_start_background(&th, &attr, GlobalUpdate, NULL) == 0)
         << "Fail to start GlobalUpdate";
 }
 

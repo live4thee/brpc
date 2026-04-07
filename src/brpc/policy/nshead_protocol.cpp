@@ -69,7 +69,7 @@ void NsheadClosure::Run() {
     std::unique_ptr<NsheadClosure, DeleteNsheadClosure> recycle_ctx(this);
 
     ControllerPrivateAccessor accessor(&_controller);
-    Span* span = accessor.span();
+    auto span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
@@ -95,6 +95,7 @@ void NsheadClosure::Run() {
         return;
     }
 
+    int64_t sent_us = 0;
     if (_do_respond) {
         // response uses request's head as default.
         // Notice that the response use request.head.log_id directly rather
@@ -112,8 +113,15 @@ void NsheadClosure::Run() {
         write_buf.append(_response.body.movable());
         // Have the risk of unlimited pending responses, in which case, tell
         // users to set max_concurrency.
+        ResponseWriteInfo args;
         Socket::WriteOptions wopt;
         wopt.ignore_eovercrowded = true;
+        bthread_id_t response_id = INVALID_BTHREAD_ID;
+        if (span) {
+            CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+            wopt.id_wait = response_id;
+            wopt.notify_on_success = true;
+        }
         if (sock->Write(&write_buf, &wopt) != 0) {
             const int errcode = errno;
             PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -121,17 +129,22 @@ void NsheadClosure::Run() {
                                   sock->description().c_str());
             return;
         }
+
+        if (span) {
+            bthread_id_join(response_id);
+            // Do not care about the result of background writing.
+            sent_us = args.sent_us;
+        }
     }
     if (span) {
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
+        span->set_sent_us(0 == sent_us ? butil::cpuwide_time_us() : sent_us);
     }
 }
 
 void NsheadClosure::SetMethodName(const std::string& full_method_name) {
     ControllerPrivateAccessor accessor(&_controller);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->ResetServerSpanName(full_method_name);
     }
 }
@@ -284,7 +297,7 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
         bthread_assign_data((void*)&server->thread_local_options());
     }
 
-    Span* span = NULL;
+    std::shared_ptr<Span> span;
     if (IsTraceable(false)) {
         span = Span::CreateServerSpan(0, 0, 0, msg->base_real_us());
         accessor.set_span(span);
@@ -301,7 +314,7 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
             cntl->SetFailed(ELOGOFF, "Server is stopping");
             break;
         }
-        if (socket->is_overcrowded()) {
+        if (socket->is_overcrowded() && !server->options().ignore_eovercrowded) {
             cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
                             butil::endpoint2str(socket->remote_side()).c_str());
             break;
@@ -355,8 +368,7 @@ void ProcessNsheadResponse(InputMessageBase* msg_base) {
     }
 
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->payload.length());
@@ -425,8 +437,7 @@ void PackNsheadRequest(
     // pack the field.
     accessor.get_sending_socket()->set_correlation_id(correlation_id);
 
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_request_size(request.length());
         // TODO: Nowhere to set tracing ids.
         // request_meta->set_trace_id(span->trace_id());

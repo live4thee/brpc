@@ -116,7 +116,16 @@ ParseResult ParseStreamingMessage(butil::IOBuf* source,
             break;
         }
         meta_buf.clear();  // to reduce memory resident
-        ((Stream*)ptr->conn())->OnReceived(fm, &payload, socket);
+        // ptr->conn() returns the connection-level context attached to the
+        // socket.  It may be NULL when the socket was found by ID but has no
+        // Stream object associated (e.g. during protocol probing or fuzz
+        // testing).  Calling OnReceived on a null pointer would crash.
+        Stream* stream_conn = (Stream*)ptr->conn();
+        if (stream_conn == NULL) {
+            LOG(FATAL) << "No stream object found";
+            break;
+        }
+        stream_conn->OnReceived(fm, &payload, socket);
     } while (0);
 
     // Hack input messenger
@@ -154,7 +163,8 @@ void SendStreamClose(Socket *sock, int64_t remote_stream_id,
 }
 
 int SendStreamData(Socket* sock, const butil::IOBuf* data,
-                   int64_t remote_stream_id, int64_t source_stream_id) {
+                   int64_t remote_stream_id, int64_t source_stream_id,
+                   bthread_id_t response_id) {
     CHECK(sock != NULL);
     StreamFrameMeta fm;
     fm.set_stream_id(remote_stream_id);
@@ -164,6 +174,10 @@ int SendStreamData(Socket* sock, const butil::IOBuf* data,
     butil::IOBuf out;
     PackStreamMessage(&out, fm, data);
     Socket::WriteOptions wopt;
+    if (INVALID_BTHREAD_ID != response_id) {
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
     wopt.ignore_eovercrowded = true;
     return sock->Write(&out, &wopt);
 }

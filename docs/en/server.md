@@ -669,7 +669,7 @@ Performance issues when pthread mode is on:
 
 pthread-mode lets legacy code to try brpc more easily, but we still recommend refactoring the code with bthread-local or even remove TLS gradually, to turn off the option in future.
 
-## Security mode
+## Security
 
 If requests are from public(including being proxied by nginx etc), you have to be aware of some security issues.
 
@@ -708,6 +708,10 @@ brpc::WebEscape() escapes url to prevent injection attacks with malice.
 ### Not return addresses of internal servers
 
 Consider returning signatures of the addresses. For example after setting ServerOptions.internal_port, addresses in error information returned by server is replaced by their MD5 signatures.
+
+### Not start the brpc process as the root user
+
+During its operation, brpc writes various files (such as server pid files, rpcz, rpc dump, profiling, etc.). If brpc runs as the root user, attackers may exploit this feature to perform unauthorized file writes. Therefore, regardless of whether brpc provides network services or not, it is not recommended to start the brpc process as the root user.
 
 ## Customize /health
 
@@ -1007,6 +1011,69 @@ public:
         }
         ...
 ```
+
+## RPC Protobuf message factory
+
+`DefaultRpcPBMessageFactory' is used at server-side by default. It is a simple factory class that uses `new' to create request/response messages and `delete' to destroy request/response messages. Currently, the baidu_std protocol and HTTP protocol support this feature.
+
+Users can implement `RpcPBMessages' (encapsulation of request/response message) and `RpcPBMessageFactory' (factory class) to customize the creation and destruction mechanism of protobuf message, and then set to `ServerOptions.rpc_pb_message_factory`. Note: After the server is started, the server owns the `RpcPBMessageFactory`.
+
+The interface is as follows:
+
+```c++
+// Inherit this class to customize rpc protobuf messages,
+// include request and response.
+class RpcPBMessages {
+public:
+    virtual ~RpcPBMessages() = default;
+    // Get protobuf request message.
+    virtual google::protobuf::Message* Request() = 0;
+    // Get protobuf response message.
+    virtual google::protobuf::Message* Response() = 0;
+};
+
+// Factory to manage `RpcPBMessages'.
+class RpcPBMessageFactory {
+public:
+    virtual ~RpcPBMessageFactory() = default;
+    // Get `RpcPBMessages' according to `service' and `method'.
+    // Common practice to create protobuf message:
+    // service.GetRequestPrototype(&method).New() -> request;
+    // service.GetResponsePrototype(&method).New() -> response.
+    virtual RpcPBMessages* Get(const ::google::protobuf::Service& service,
+                               const ::google::protobuf::MethodDescriptor& method) = 0;
+    // Return `RpcPBMessages' to factory.
+    virtual void Return(RpcPBMessages* protobuf_message) = 0;
+};
+```
+
+### Protobuf arena
+
+Protobuf arena is a Protobuf message memory management mechanism with the advantages of improving memory allocation efficiency, reducing memory fragmentation, and being cache-friendly. For more information, see [C++ Arena Allocation Guide](https://protobuf.dev/reference/cpp/arenas/).
+
+Users can set `ServerOptions.rpc_pb_message_factory = brpc::GetArenaRpcPBMessageFactory();` to manage Protobuf message memory,  with the default `start_block_size` (256 bytes) and `max_block_size` (8192 bytes). Alternatively, users can use `brpc::GetArenaRpcPBMessageFactory<StartBlockSize, MaxBlockSize>();` to customize the arena size.
+
+Note: Since Protocol Buffers v3.14.0, Arenas are now unconditionally enabled. However, for versions prior to Protobuf v3.14.0, users need to add the option `option cc_enable_arenas = true;` to the proto file. so for compatibility, this option can be added uniformly.
+
+## Ignoring eovercrowded on server-side
+### Ignore eovercrowded on server-level
+
+Set ServerOptions.ignore_eovercrowded. Default value is 0 which means not ignored.
+
+### Ignore eovercrowded on method-level
+
+server.IgnoreEovercrowdedOf("...") = … sets ignore_eovercrowded of the method. Possible settings:
+
+```c++
+ServerOptions.ignore_eovercrowded = true;                   // Set the default ignore_eovercrowded for all methods
+server.IgnoreEovercrowdedOf("example.EchoService.Echo") = true;
+```
+
+The code is generally put **after AddService, before Start() of the server**. When a setting fails(namely the method does not exist), server will fail to start and notify user to fix settings on IgnoreEovercrowdedOf.
+
+When method-level and server-level ignore_eovercrowded are both set, if any one of them is set to true, eovercrowded will be ignored.
+
+NOTE: No service-level ignore_eovercrowded.
 
 # FAQ
 

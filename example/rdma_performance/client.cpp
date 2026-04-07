@@ -102,7 +102,7 @@ public:
 
     int Init() {
         brpc::ChannelOptions options;
-        options.use_rdma = FLAGS_use_rdma;
+        options.socket_mode = FLAGS_use_rdma? brpc::SOCKET_MODE_RDMA : brpc::SOCKET_MODE_TCP;
         options.protocol = FLAGS_protocol;
         options.connection_type = FLAGS_connection_type;
         options.timeout_ms = FLAGS_rpc_timeout_ms;
@@ -272,7 +272,7 @@ void Test(int thread_num, int attachment_size) {
 }
 
 int main(int argc, char* argv[]) {
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // Initialize RDMA environment in advance.
     if (FLAGS_use_rdma) {

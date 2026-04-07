@@ -254,6 +254,13 @@ inline uint64_t clock_cycles() {
         : "=r" (stable_counter), "=r" (counter_id)
         );
     return stable_counter;
+#elif defined(__riscv)
+    uint64_t cycles;
+    __asm__ __volatile__ (
+        "rdcycle %0"
+        : "=r" (cycles)
+        );
+    return cycles;
 #else
   #error "unsupported arch"
 #endif
@@ -301,6 +308,14 @@ inline int64_t cpuwide_time_ns() {
         return cpuwide_time_ns();
     }
 #endif // defined(BAIDU_INTERNAL)
+}
+
+// Get cpu clock time of the current thread in nanoseconds without the time spent in blocking I/O operations.
+// Cost ~200ns
+inline int64_t cputhread_time_ns() {
+    timespec now;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
+    return now.tv_sec * 1000000000L + now.tv_nsec;
 }
 
 inline int64_t cpuwide_time_us() {
@@ -376,7 +391,7 @@ public:
     };
 
     Timer() : _stop(0), _start(0) {}
-    explicit Timer(const TimerType) {
+    explicit Timer(const TimerType) : Timer() {
         start();
     }
 

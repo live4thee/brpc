@@ -24,8 +24,12 @@ option(WITH_BORINGSSL "With BoringSSL" OFF)
 option(DEBUG "Print debug logs" OFF)
 option(WITH_DEBUG_SYMBOLS "With debug symbols" ON)
 option(WITH_THRIFT "With thrift framed protocol supported" OFF)
+option(WITH_BTHREAD_TRACER "With bthread tracer supported" OFF)
 option(WITH_SNAPPY "With snappy" OFF)
 option(WITH_RDMA "With RDMA" OFF)
+option(WITH_DEBUG_BTHREAD_SCHE_SAFETY "With debugging bthread sche safety" OFF)
+option(WITH_DEBUG_LOCK "With debugging lock" OFF)
+option(WITH_ASAN "With AddressSanitizer" OFF)
 option(BUILD_UNIT_TESTS "Whether to build unit tests" OFF)
 option(BUILD_FUZZ_TESTS "Whether to build fuzz tests" OFF)
 option(BUILD_BRPC_TOOLS "Whether to build brpc tools" ON)
@@ -36,7 +40,7 @@ if(POLICY CMP0042)
     cmake_policy(SET CMP0042 NEW)
 endif()
 
-set(BRPC_VERSION 1.10.0)
+set(BRPC_VERSION 1.16.0)
 
 SET(CPACK_GENERATOR "DEB")
 SET(CPACK_DEBIAN_PACKAGE_MAINTAINER "brpc authors")
@@ -66,6 +70,11 @@ if(WITH_DEBUG_SYMBOLS)
     set(DEBUG_SYMBOL "-g")
 endif()
 
+set(WITH_DEBUG_LOCK_VAL "0")
+if(WITH_DEBUG_LOCK)
+    set(WITH_DEBUG_LOCK_VAL "1")
+endif()
+
 if(WITH_THRIFT)
     set(THRIFT_CPP_FLAG "-DENABLE_THRIFT_FRAMED_PROTOCOL")
     find_library(THRIFT_LIB NAMES thrift)
@@ -74,29 +83,39 @@ if(WITH_THRIFT)
     endif()
 endif()
 
+if (WITH_BTHREAD_TRACER)
+    if (NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux")  OR NOT (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64"))
+        message(FATAL_ERROR "bthread tracer is only supported on Linux x86_64 platform")
+    endif()
+    find_path(LIBUNWIND_INCLUDE_PATH NAMES libunwind.h)
+    find_library(LIBUNWIND_LIB NAMES unwind)
+    find_library(LIBUNWIND_X86_64_LIB NAMES unwind-x86_64)
+    if (NOT LIBUNWIND_INCLUDE_PATH OR NOT LIBUNWIND_LIB)
+        message(FATAL_ERROR "Fail to find libunwind, which is needed by bthread tracer")
+    endif()
+    find_package(absl REQUIRED CONFIG)
+    set(bthread_tracer_ABSL_USED_TARGETS absl::base absl::stacktrace absl::symbolize)
+    add_definitions(-DBRPC_BTHREAD_TRACER)
+    include_directories(${LIBUNWIND_INCLUDE_PATH})
+endif ()
+
 set(WITH_RDMA_VAL "0")
 if(WITH_RDMA)
     set(WITH_RDMA_VAL "1")
+endif()
+
+set(WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL "0")
+if(WITH_DEBUG_BTHREAD_SCHE_SAFETY)
+    set(WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL "1")
 endif()
 
 include(GNUInstallDirs)
 
 configure_file(${PROJECT_SOURCE_DIR}/config.h.in ${PROJECT_SOURCE_DIR}/src/butil/config.h @ONLY)
 
-set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 find_package(GFLAGS REQUIRED)
-
-execute_process(
-    COMMAND bash -c "grep \"namespace [_A-Za-z0-9]\\+ {\" ${GFLAGS_INCLUDE_PATH}/gflags/gflags_declare.h | head -1 | awk '{print $2}' | tr -d '\n'"
-    OUTPUT_VARIABLE GFLAGS_NS
-)
-if(${GFLAGS_NS} STREQUAL "GFLAGS_NAMESPACE")
-    execute_process(
-        COMMAND bash -c "grep \"#define GFLAGS_NAMESPACE [_A-Za-z0-9]\\+\" ${GFLAGS_INCLUDE_PATH}/gflags/gflags_declare.h | head -1 | awk '{print $3}' | tr -d '\n'"
-        OUTPUT_VARIABLE GFLAGS_NS
-    )
-endif()
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/src
@@ -117,13 +136,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -Wno-deprecated-declarations -Wno-inconsistent-missing-override")
 endif()
 
-set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL} -DGFLAGS_NS=${GFLAGS_NS}")
+set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL} -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=${WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL} -DBRPC_DEBUG_LOCK=${WITH_DEBUG_LOCK_VAL}")
+if (WITH_ASAN)
+    set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -fsanitize=address")
+    set(CMAKE_C_FLAGS "${CMAKE_CPP_FLAGS} -fsanitize=address")
+endif()
 if(WITH_MESALINK)
     set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DUSE_MESALINK")
 endif()
 set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__=__unused__ -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DBRPC_REVISION=\\\"${BRPC_REVISION}\\\" -D__STRICT_ANSI__")
 set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEBUG_SYMBOL} ${THRIFT_CPP_FLAG}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} ${CMAKE_CXX_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer")
 set(CMAKE_C_FLAGS "${CMAKE_CPP_FLAGS} -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-unused-parameter -fno-omit-frame-pointer")
 
 macro(use_cxx11)
@@ -147,6 +170,9 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64"))
         # segmentation fault in libcontext
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-gcse")
+    elseif((CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64"))
+        # RISC-V specific optimizations
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gc")
     endif()
     if(NOT (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0))
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-aligned-new")
@@ -283,11 +309,12 @@ if(WITH_BORINGSSL)
     list(APPEND DYNAMIC_LIB ${BORINGSSL_SSL_LIBRARY})
     list(APPEND DYNAMIC_LIB ${BORINGSSL_CRYPTO_LIBRARY})
 else()
-    list(APPEND DYNAMIC_LIB ${OPENSSL_CRYPTO_LIBRARY})
     if(WITH_MESALINK)
+        list(APPEND DYNAMIC_LIB ${OPENSSL_CRYPTO_LIBRARY})
         list(APPEND DYNAMIC_LIB ${MESALINK_LIB})
     else()
         list(APPEND DYNAMIC_LIB ${OPENSSL_SSL_LIBRARY})
+        list(APPEND DYNAMIC_LIB ${OPENSSL_CRYPTO_LIBRARY})
     endif()
 endif()
 
@@ -298,13 +325,18 @@ endif()
 set(BRPC_PRIVATE_LIBS "-lgflags -lprotobuf -lleveldb -lprotoc -lssl -lcrypto -ldl -lz")
 
 if(WITH_GLOG)
-    set(DYNAMIC_LIB ${DYNAMIC_LIB} ${GLOG_LIB})
-    set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -lglog")
+    set(DYNAMIC_LIB ${GLOG_LIB} ${DYNAMIC_LIB})
+    set(BRPC_PRIVATE_LIBS "-lglog ${BRPC_PRIVATE_LIBS}")
 endif()
 
 if(WITH_SNAPPY)
     set(DYNAMIC_LIB ${DYNAMIC_LIB} ${SNAPPY_LIB})
     set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -lsnappy")
+endif()
+
+if (WITH_BTHREAD_TRACER)
+    set(DYNAMIC_LIB ${DYNAMIC_LIB} ${LIBUNWIND_LIB} ${LIBUNWIND_X86_64_LIB} ${bthread_tracer_ABSL_USED_TARGETS})
+    set(BRPC_PRIVATE_LIBS "${BRPC_PRIVATE_LIBS} -lunwind -lunwind-x86_64  -labsl_stacktrace -labsl_symbolize -labsl_debugging_internal -labsl_demangle_internal -labsl_malloc_internal -labsl_raw_logging_internal -labsl_spinlock_wait -labsl_base")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -322,7 +354,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         "-Wl,-U,_MallocExtension_ReleaseFreeMemory"
         "-Wl,-U,_ProfilerStart"
         "-Wl,-U,_ProfilerStop"
-        "-Wl,-U,__Z13GetStackTracePPvii")
+        "-Wl,-U,__Z13GetStackTracePPvii"
+        "-Wl,-U,_mallctl"
+        "-Wl,-U,_malloc_stats_print"
+    )
 endif()
 
 # for *.so
@@ -444,6 +479,7 @@ set(BUTIL_SOURCES
     ${PROJECT_SOURCE_DIR}/src/butil/crc32c.cc
     ${PROJECT_SOURCE_DIR}/src/butil/containers/case_ignored_flat_map.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/iobuf.cpp
+    ${PROJECT_SOURCE_DIR}/src/butil/single_iobuf.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/iobuf_profiler.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/binary_printer.cpp
     ${PROJECT_SOURCE_DIR}/src/butil/recordio.cc

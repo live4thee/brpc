@@ -102,6 +102,7 @@ typedef pthread_mutex_t* MutexHandle;
 #include "butil/containers/doubly_buffered_data.h"
 #include "butil/memory/singleton.h"
 #include "butil/endpoint.h"
+#include "butil/reloadable_flags.h"
 #ifdef BAIDU_INTERNAL
 #include "butil/comlog_sink.h"
 #endif
@@ -122,8 +123,11 @@ namespace logging {
 
 DEFINE_bool(crash_on_fatal_log, false,
             "Crash process when a FATAL log is printed");
+BUTIL_VALIDATE_GFLAG(crash_on_fatal_log, butil::PassValidate);
+
 DEFINE_bool(print_stack_on_check, true,
             "Print the stack trace when a CHECK was failed");
+BUTIL_VALIDATE_GFLAG(print_stack_on_check, butil::PassValidate);
 
 DEFINE_int32(v, 0, "Show all VLOG(m) messages for m <= this."
              " Overridable by --vmodule.");
@@ -140,6 +144,7 @@ DEFINE_bool(log_bid, true, "Log bthread id");
 DEFINE_int32(minloglevel, 0, "Any log at or above this level will be "
              "displayed. Anything below this level will be silently ignored. "
              "0=INFO 1=NOTICE 2=WARNING 3=ERROR 4=FATAL");
+BUTIL_VALIDATE_GFLAG(minloglevel, butil::NonNegativeInteger);
 
 DEFINE_bool(log_hostname, false, "Add host after pid in each log so"
             " that we know where logs came from when using aggregation tools"
@@ -147,7 +152,10 @@ DEFINE_bool(log_hostname, false, "Add host after pid in each log so"
 
 DEFINE_bool(log_year, false, "Log year in datetime part in each log");
 
-DEFINE_bool(log_func_name, false, "Log function name in each log");
+DEFINE_bool(log_func_name, false, "[DEPRECATED]Log function name in each log. "
+                                  "Now DefaultLogSink logs function names by default. "
+                                  "Customized LogSink can also log function names through "
+                                  "corresponding OnLogMessage.");
 
 DEFINE_bool(async_log, false, "Use async log");
 
@@ -390,7 +398,7 @@ bool InitializeLogFileHandle() {
 #elif defined(OS_POSIX)
         log_file = fopen(log_file_name->c_str(), "a");
         if (log_file == NULL) {
-            fprintf(stderr, "Fail to fopen %s", log_file_name->c_str());
+            fprintf(stderr, "Fail to fopen %s: %s", log_file_name->c_str(), berror());
             return false;
         }
 #endif
@@ -459,6 +467,13 @@ TimeVal GetTimestamp() {
 }
 
 struct BAIDU_CACHELINE_ALIGNMENT LogInfo {
+    ~LogInfo() = default;
+    void clear() {
+        file.clear();
+        func.clear();
+        content.clear();
+    }
+
     std::string file;
     std::string func;
     std::string content;
@@ -746,7 +761,7 @@ bool AsyncLogger::IsLogComplete(LogRequest* old_head) {
 
 void AsyncLogger::DoLog(LogRequest* req) {
     DoLog(req->log_info);
-    req->log_info.content.clear();
+    req->log_info.clear();
 }
 
 void AsyncLogger::DoLog(const LogInfo& log_info) {
@@ -1334,7 +1349,7 @@ void LogStream::FlushWithoutReset() {
     }
 
 #if !defined(OS_NACL) && !defined(__UCLIBC__)
-    if (FLAGS_print_stack_on_check && _is_check && _severity == BLOG_FATAL) {
+    if ((FLAGS_print_stack_on_check && _is_check && _severity == BLOG_FATAL) || _backtrace) {
         // Include a stack trace on a fatal.
         butil::debug::StackTrace trace;
         size_t count = 0;
@@ -1369,14 +1384,8 @@ void LogStream::FlushWithoutReset() {
         DoublyBufferedLogSink::ScopedPtr ptr;
         if (DoublyBufferedLogSink::GetInstance()->Read(&ptr) == 0 &&
             (*ptr) != NULL) {
-            bool result = false;
-            if (FLAGS_log_func_name) {
-                result = (*ptr)->OnLogMessage(_severity, _file, _line,
-                                              _func, content());
-            } else {
-                result = (*ptr)->OnLogMessage(_severity, _file,
-                                              _line, content());
-            }
+            bool result = (*ptr)->OnLogMessage(
+                _severity, _file, _line, _func, content());
             if (result) {
                 goto FINISH_LOGGING;
             }
@@ -1396,13 +1405,8 @@ void LogStream::FlushWithoutReset() {
     }
 #endif
     if (!tried_default) {
-        if (FLAGS_log_func_name) {
-            DefaultLogSink::GetInstance()->OnLogMessage(
-                _severity, _file, _line, _func, content());
-        } else {
-            DefaultLogSink::GetInstance()->OnLogMessage(
-                _severity, _file, _line, content());
-        }
+        DefaultLogSink::GetInstance()->OnLogMessage(
+            _severity, _file, _line, _func, content());
     }
 
 FINISH_LOGGING:
@@ -1930,7 +1934,7 @@ static bool validate_vmodule(const char*, const std::string& vmodule) {
     return on_reset_vmodule(vmodule.c_str()) == 0;
 }
 
-const bool ALLOW_UNUSED validate_vmodule_dummy = GFLAGS_NS::RegisterFlagValidator(
+const bool ALLOW_UNUSED validate_vmodule_dummy = GFLAGS_NAMESPACE::RegisterFlagValidator(
     &FLAGS_vmodule, &validate_vmodule);
 
 // [Thread-safe] Reset FLAGS_v.
@@ -1959,26 +1963,7 @@ static bool validate_v(const char*, int32_t v) {
     on_reset_verbose(v);
     return true;
 }
-
-const bool ALLOW_UNUSED validate_v_dummy = GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_v, &validate_v);
-
-static bool PassValidate(const char*, bool) {
-    return true;
-}
-
-const bool ALLOW_UNUSED validate_crash_on_fatal_log =
-    GFLAGS_NS::RegisterFlagValidator(&FLAGS_crash_on_fatal_log, PassValidate);
-
-const bool ALLOW_UNUSED validate_print_stack_on_check =
-    GFLAGS_NS::RegisterFlagValidator(&FLAGS_print_stack_on_check, PassValidate);
-
-static bool NonNegativeInteger(const char*, int32_t v) {
-    return v >= 0;
-}
-
-const bool ALLOW_UNUSED validate_min_log_level = GFLAGS_NS::RegisterFlagValidator(
-    &FLAGS_minloglevel, NonNegativeInteger);
+BUTIL_VALIDATE_GFLAG(v, validate_v);
 
 }  // namespace logging
 

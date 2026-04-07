@@ -39,6 +39,16 @@ namespace bvar {
 
 DECLARE_bool(save_series);
 
+#define COMMON_VARIABLE_CONSTRUCTOR(TypeName)                                    \
+    TypeName() = default;                                                        \
+    TypeName(const butil::StringPiece& name) {                                   \
+        this->expose(name);                                                      \
+    }                                                                            \
+    TypeName(const butil::StringPiece& prefix, const butil::StringPiece& name) { \
+        this->expose_as(prefix, name);                                           \
+    }                                                                            \
+
+
 // Bitwise masks of displayable targets 
 enum DisplayFilter {
     DISPLAY_ON_HTML = 1,
@@ -53,6 +63,12 @@ public:
     virtual ~Dumper() { }
     virtual bool dump(const std::string& name,
                       const butil::StringPiece& description) = 0;
+    // Only for dumping value of multiple dimension var to prometheus service
+    virtual bool dump_mvar(const std::string& name,
+                           const butil::StringPiece& description) {
+        return true;
+    }
+    // Only for dumping comment of multiple dimension var to prometheus service
     virtual bool dump_comment(const std::string&, const std::string& /*type*/) {
         return true;
     }

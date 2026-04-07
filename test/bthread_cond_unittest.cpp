@@ -21,7 +21,7 @@
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "butil/scoped_lock.h"
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "bthread/bthread.h"
 #include "bthread/condition_variable.h"
 #include "bthread/stack.h"
@@ -138,7 +138,10 @@ TEST(CondTest, sanity) {
 struct WrapperArg {
     bthread::Mutex mutex;
     bthread::ConditionVariable cond;
+    bool ready = false;
+    static std::atomic<int> wake_time;
 };
+std::atomic<int> WrapperArg::wake_time{0};
 
 void* cv_signaler(void* void_arg) {
     WrapperArg* a = (WrapperArg*)void_arg;
@@ -165,6 +168,23 @@ void* cv_mutex_waiter(void* void_arg) {
     while (!stop) {
         a->cond.wait(lck);
     }
+    return NULL;
+}
+
+
+void* cv_bmutex_waiter_with_pred(void* void_arg) {
+    WrapperArg* a = (WrapperArg*)void_arg;
+    std::unique_lock<bthread_mutex_t> lck(*a->mutex.native_handler());
+    a->cond.wait(lck, [&] { return a->ready; });
+    WrapperArg::wake_time.fetch_add(1);
+    return NULL;
+}
+
+void* cv_mutex_waiter_with_pred(void* void_arg) {
+    WrapperArg* a = (WrapperArg*)void_arg;
+    std::unique_lock<bthread::Mutex> lck(a->mutex);
+    a->cond.wait(lck, [&] { return a->ready; });
+    WrapperArg::wake_time.fetch_add(1);
     return NULL;
 }
 
@@ -200,6 +220,37 @@ TEST(CondTest, cpp_wrapper) {
         pthread_join(bmutex_waiter_threads[i], NULL);
         pthread_join(mutex_waiter_threads[i], NULL);
     }
+}
+
+TEST(CondTest, cpp_wrapper2) {
+    stop = false;
+    bthread::ConditionVariable cond;
+    pthread_t bmutex_waiter_threads[8];
+    pthread_t mutex_waiter_threads[8];
+    pthread_t signal_thread;
+    WrapperArg a;
+    for (size_t i = 0; i < ARRAY_SIZE(bmutex_waiter_threads); ++i) {
+        ASSERT_EQ(0, pthread_create(&bmutex_waiter_threads[i], NULL,
+                                    cv_bmutex_waiter_with_pred, &a));
+        ASSERT_EQ(0, pthread_create(&mutex_waiter_threads[i], NULL,
+                                    cv_mutex_waiter_with_pred, &a));
+    }
+    ASSERT_EQ(0, pthread_create(&signal_thread, NULL, cv_signaler, &a));
+    bthread_usleep(100L * 1000);
+    ASSERT_EQ(WrapperArg::wake_time, 0);
+    {
+        BAIDU_SCOPED_LOCK(a.mutex);
+        stop = true;
+        a.ready = true;
+
+    }
+    pthread_join(signal_thread, NULL);
+    a.cond.notify_all();
+    for (size_t i = 0; i < ARRAY_SIZE(bmutex_waiter_threads); ++i) {
+        pthread_join(bmutex_waiter_threads[i], NULL);
+        pthread_join(mutex_waiter_threads[i], NULL);
+    }
+    ASSERT_EQ(WrapperArg::wake_time, 16);
 }
 
 #ifndef COND_IN_PTHREAD
@@ -397,6 +448,7 @@ private:
     bthread_mutex_t _mutex;
 };
 
+#ifndef BUTIL_USE_ASAN
 volatile bool g_stop = false;
 bool started_wait = false;
 bool ended_wait = false;
@@ -445,6 +497,7 @@ static void launch_many_bthreads() {
 }
 
 TEST(CondTest, too_many_bthreads_from_pthread) {
+    bthread_setconcurrency(16);
     launch_many_bthreads();
 }
 
@@ -454,8 +507,10 @@ static void* run_launch_many_bthreads(void*) {
 }
 
 TEST(CondTest, too_many_bthreads_from_bthread) {
+    bthread_setconcurrency(16);
     bthread_t th;
     ASSERT_EQ(0, bthread_start_urgent(&th, NULL, run_launch_many_bthreads, NULL));
     bthread_join(th, NULL);
 }
+#endif // BUTIL_USE_ASAN
 } // namespace

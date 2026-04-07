@@ -17,12 +17,16 @@
 
 // Date 2021/11/17 14:57:49
 
+// #if __cplusplus >= 201703L
+#include <string_view>
+// #endif // __cplusplus >= 201703L
 #include <pthread.h>                                // pthread_*
 #include <cstddef>
 #include <memory>
 #include <iostream>
 #include <set>
 #include <string>
+#include <array>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include "butil/time.h"
@@ -30,20 +34,7 @@
 #include "bvar/bvar.h"
 #include "bvar/multi_dimension.h"
 
-static const int num_thread = 24;
-
-static const int idc_count = 20;
-static const int method_count = 20;
-static const int status_count = 50;
-static const int labels_count = idc_count * method_count * status_count;
-
 static const std::list<std::string> labels = {"idc", "method", "status"};
-
-struct thread_perf_data {
-    bvar::MVariable* mbvar;
-    bvar::Variable*  rbvar;
-    bvar::Variable*  wbvar;
-};
 
 class MVariableTest : public testing::Test {
 protected:
@@ -66,9 +57,9 @@ TEST_F(MVariableTest, expose) {
     std::vector<std::string> list_exposed_vars;
     std::list<std::string> labels_value1 {"bj", "get", "200"};
     bvar::MultiDimension<bvar::Adder<int> > my_madder1(labels);
-    ASSERT_EQ(0UL, bvar::MVariable::count_exposed());
+    ASSERT_EQ(0UL, bvar::MVariableBase::count_exposed());
     my_madder1.expose("request_count_madder");
-    ASSERT_EQ(1UL, bvar::MVariable::count_exposed());
+    ASSERT_EQ(1UL, bvar::MVariableBase::count_exposed());
     bvar::Adder<int>* my_adder1 = my_madder1.get_stats(labels_value1);
     ASSERT_TRUE(my_adder1);
     ASSERT_STREQ("request_count_madder", my_madder1.name().c_str());
@@ -102,54 +93,28 @@ TEST_F(MVariableTest, expose) {
     list_exposed_vars.push_back("request_count_madder");
 
     ASSERT_EQ(1UL, my_madder1.count_stats());
-    ASSERT_EQ(1UL, bvar::MVariable::count_exposed());
+    ASSERT_EQ(1UL, bvar::MVariableBase::count_exposed());
 
     std::list<std::string> labels2 {"user", "url", "cost"};
     bvar::MultiDimension<bvar::Adder<int> > my_madder2("client_url", labels2);
-    ASSERT_EQ(2UL, bvar::MVariable::count_exposed());
+    ASSERT_EQ(2UL, bvar::MVariableBase::count_exposed());
     list_exposed_vars.push_back("client_url");
 
     std::list<std::string> labels3 {"product", "system", "module"};
     bvar::MultiDimension<bvar::Adder<int> > my_madder3("request_from", labels3);
     list_exposed_vars.push_back("request_from");
-    ASSERT_EQ(3UL, bvar::MVariable::count_exposed());
+    ASSERT_EQ(3UL, bvar::MVariableBase::count_exposed());
 
     std::vector<std::string> exposed_vars;
-    bvar::MVariable::list_exposed(&exposed_vars);
+    bvar::MVariableBase::list_exposed(&exposed_vars);
     ASSERT_EQ(3, exposed_vars.size());
 
     my_madder3.hide();
-    ASSERT_EQ(2UL, bvar::MVariable::count_exposed());
+    ASSERT_EQ(2UL, bvar::MVariableBase::count_exposed());
     list_exposed_vars.pop_back();
     exposed_vars.clear();
-    bvar::MVariable::list_exposed(&exposed_vars);
+    bvar::MVariableBase::list_exposed(&exposed_vars);
     ASSERT_EQ(2, exposed_vars.size());
-}
-
-TEST_F(MVariableTest, labels) {
-    std::list<std::string> labels_value1 {"bj", "get", "200"};
-    bvar::MultiDimension<bvar::Adder<int> > my_madder1("request_count_madder", labels);
-
-    ASSERT_EQ(labels.size(), my_madder1.count_labels());
-    ASSERT_STREQ("request_count_madder", my_madder1.name().c_str());
-
-    ASSERT_EQ(labels, my_madder1.labels());
-
-    std::list<std::string> labels_too_long;
-    std::list<std::string> labels_max;
-    int labels_too_long_count = 15;
-    for (int i = 0; i < labels_too_long_count; ++i) {
-        std::ostringstream os;
-        os << "label" << i;
-        labels_too_long.push_back(os.str());
-        if (i < 10) {
-            labels_max.push_back(os.str());
-        }
-    }
-    ASSERT_EQ(labels_too_long_count, labels_too_long.size());
-    bvar::MultiDimension<bvar::Adder<int> > my_madder2("request_labels_too_long", labels_too_long);
-    ASSERT_EQ(10, my_madder2.count_labels());
-    ASSERT_EQ(labels_max, my_madder2.labels());
 }
 
 TEST_F(MVariableTest, dump) {
@@ -158,15 +123,15 @@ TEST_F(MVariableTest, dump) {
     std::string old_mbvar_dump_prefix;
     std::string old_mbvar_dump_format;
 
-    GFLAGS_NS::GetCommandLineOption("bvar_dump_interval", &old_bvar_dump_interval);
-    GFLAGS_NS::GetCommandLineOption("mbvar_dump", &old_mbvar_dump);
-    GFLAGS_NS::GetCommandLineOption("mbvar_dump_prefix", &old_mbvar_dump_prefix);
-    GFLAGS_NS::GetCommandLineOption("mbvar_dump_format", &old_mbvar_dump_format);
+    GFLAGS_NAMESPACE::GetCommandLineOption("bvar_dump_interval", &old_bvar_dump_interval);
+    GFLAGS_NAMESPACE::GetCommandLineOption("mbvar_dump", &old_mbvar_dump);
+    GFLAGS_NAMESPACE::GetCommandLineOption("mbvar_dump_prefix", &old_mbvar_dump_prefix);
+    GFLAGS_NAMESPACE::GetCommandLineOption("mbvar_dump_format", &old_mbvar_dump_format);
 
-    GFLAGS_NS::SetCommandLineOption("bvar_dump_interval", "1");
-    GFLAGS_NS::SetCommandLineOption("mbvar_dump", "true");
-    GFLAGS_NS::SetCommandLineOption("mbvar_dump_prefix", "my_mdump_prefix");
-    GFLAGS_NS::SetCommandLineOption("mbvar_dump_format", "common");
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_dump_interval", "1");
+    GFLAGS_NAMESPACE::SetCommandLineOption("mbvar_dump", "true");
+    GFLAGS_NAMESPACE::SetCommandLineOption("mbvar_dump_prefix", "my_mdump_prefix");
+    GFLAGS_NAMESPACE::SetCommandLineOption("mbvar_dump_format", "common");
 
     bvar::MultiDimension<bvar::Adder<int> > my_madder("dump_adder", labels);
     std::list<std::string> labels_value1 {"gz", "post", "200"};
@@ -218,20 +183,19 @@ TEST_F(MVariableTest, dump) {
     *my_latencyrecorder1 << 3 << 6 << 9;
     sleep(2);
     
-    GFLAGS_NS::SetCommandLineOption("bvar_dump_interval", old_bvar_dump_interval.c_str());
-    GFLAGS_NS::SetCommandLineOption("mbvar_dump", old_mbvar_dump.c_str());
-    GFLAGS_NS::SetCommandLineOption("mbvar_dump_prefix", old_mbvar_dump_prefix.c_str());
-    GFLAGS_NS::SetCommandLineOption("mbvar_dump_format", old_mbvar_dump_format.c_str());
+    GFLAGS_NAMESPACE::SetCommandLineOption("bvar_dump_interval", old_bvar_dump_interval.c_str());
+    GFLAGS_NAMESPACE::SetCommandLineOption("mbvar_dump", old_mbvar_dump.c_str());
+    GFLAGS_NAMESPACE::SetCommandLineOption("mbvar_dump_prefix", old_mbvar_dump_prefix.c_str());
+    GFLAGS_NAMESPACE::SetCommandLineOption("mbvar_dump_format", old_mbvar_dump_format.c_str());
 }
 
 TEST_F(MVariableTest, test_describe_exposed) {
-    std::list<std::string> labels_value1 {"bj", "get", "200"};
     std::string bvar_name("request_count_describe");
     bvar::MultiDimension<bvar::Adder<int> > my_madder1(bvar_name, labels);
 
-    std::string describe_str = bvar::MVariable::describe_exposed(bvar_name);
+    std::string describe_str = bvar::MVariableBase::describe_exposed(bvar_name);
 
     std::ostringstream describe_oss;
-    ASSERT_EQ(0, bvar::MVariable::describe_exposed(bvar_name, describe_oss));
+    ASSERT_EQ(0, bvar::MVariableBase::describe_exposed(bvar_name, describe_oss));
     ASSERT_STREQ(describe_str.c_str(), describe_oss.str().c_str());
 }

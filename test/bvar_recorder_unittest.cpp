@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 namespace {
+#if !WITH_BABYLON_COUNTER
 TEST(RecorderTest, test_complement) {
     LOG(INFO) << "sizeof(LatencyRecorder)=" << sizeof(bvar::LatencyRecorder)
               << " " << sizeof(bvar::detail::Percentile)
@@ -61,6 +62,7 @@ TEST(RecorderTest, test_compress_negtive_number) {
         ASSERT_EQ(a, bvar::IntRecorder::_extend_sign_bit(bvar::IntRecorder::_get_sum(compressed)));
     }
 }
+#endif // !WITH_BABYLON_COUNTER
 
 TEST(RecorderTest, sanity) {
     {
@@ -70,13 +72,18 @@ TEST(RecorderTest, sanity) {
         for (size_t i = 0; i < 100; ++i) {
             recorder << 2;
         }
-        ASSERT_EQ(2l, (int64_t)recorder.average());
+        ASSERT_EQ(2l, recorder.average());
         ASSERT_EQ("2", bvar::Variable::describe_exposed("var1"));
         std::vector<std::string> vars;
         bvar::Variable::list_exposed(&vars);
         ASSERT_EQ(1UL, vars.size());
         ASSERT_EQ("var1", vars[0]);
         ASSERT_EQ(1UL, bvar::Variable::count_exposed());
+    }
+    {
+        bvar::IntRecorder recorder("var2");
+        recorder << 2;
+        ASSERT_EQ(2l, recorder.average());
     }
     ASSERT_EQ(0UL, bvar::Variable::count_exposed());
 }

@@ -23,6 +23,7 @@
 #define BTHREAD_TYPES_H
 
 #include <stdint.h>                            // uint64_t
+#include "butil/macros.h"
 #if defined(__cplusplus)
 #include "butil/logging.h"                      // CHECK
 #endif
@@ -52,6 +53,7 @@ static const bthread_attrflags_t BTHREAD_LOG_CONTEXT_SWITCH = 16;
 static const bthread_attrflags_t BTHREAD_NOSIGNAL = 32;
 static const bthread_attrflags_t BTHREAD_NEVER_QUIT = 64;
 static const bthread_attrflags_t BTHREAD_INHERIT_SPAN = 128;
+static const bthread_attrflags_t BTHREAD_GLOBAL_PRIORITY = 256;
 
 // Key of thread-local data, created by bthread_key_create.
 typedef struct {
@@ -87,6 +89,7 @@ typedef struct {
     pthread_rwlock_t rwlock;
     void* list;
     void* free_keytables;
+    size_t size;
     int destroyed;
 } bthread_keytable_pool_t;
 
@@ -94,12 +97,14 @@ typedef struct {
     size_t nfree;
 } bthread_keytable_pool_stat_t;
 
+static const size_t BTHREAD_NAME_MAX_LENGTH = 31;
 // Attributes for thread creation.
 typedef struct bthread_attr_t {
     bthread_stacktype_t stack_type;
     bthread_attrflags_t flags;
     bthread_keytable_pool_t* keytable_pool;
     bthread_tag_t tag;
+    char name[BTHREAD_NAME_MAX_LENGTH + 1]; // do not use std::string to keep POD
 
 #if defined(__cplusplus)
     void operator=(unsigned stacktype_and_flags) {
@@ -117,6 +122,8 @@ typedef struct bthread_attr_t {
 #endif  // __cplusplus
 } bthread_attr_t;
 
+void bthread_attr_set_name(bthread_attr_t* attr, const char* name);
+
 // bthreads started with this attribute will run on stack of worker pthread and
 // all bthread functions that would block the bthread will block the pthread.
 // The bthread will not allocate its own stack, simply occupying a little meta
@@ -124,22 +131,22 @@ typedef struct bthread_attr_t {
 // obvious drawback is that you need more worker pthreads when you have a lot
 // of such bthreads.
 static const bthread_attr_t BTHREAD_ATTR_PTHREAD =
-{ BTHREAD_STACKTYPE_PTHREAD, 0, NULL, BTHREAD_TAG_INVALID };
+{ BTHREAD_STACKTYPE_PTHREAD, 0, NULL, BTHREAD_TAG_INVALID, {0} };
 
 // bthreads created with following attributes will have different size of
 // stacks. Default is BTHREAD_ATTR_NORMAL.
 static const bthread_attr_t BTHREAD_ATTR_SMALL = {BTHREAD_STACKTYPE_SMALL, 0, NULL,
-                                                  BTHREAD_TAG_INVALID};
+                                                  BTHREAD_TAG_INVALID, {0}};
 static const bthread_attr_t BTHREAD_ATTR_NORMAL = {BTHREAD_STACKTYPE_NORMAL, 0, NULL,
-                                                   BTHREAD_TAG_INVALID};
+                                                   BTHREAD_TAG_INVALID, {0}};
 static const bthread_attr_t BTHREAD_ATTR_LARGE = {BTHREAD_STACKTYPE_LARGE, 0, NULL,
-                                                  BTHREAD_TAG_INVALID};
+                                                  BTHREAD_TAG_INVALID, {0}};
 
 // bthreads created with this attribute will print log when it's started,
 // context-switched, finished.
 static const bthread_attr_t BTHREAD_ATTR_DEBUG = {
     BTHREAD_STACKTYPE_NORMAL, BTHREAD_LOG_START_AND_FINISH | BTHREAD_LOG_CONTEXT_SWITCH, NULL,
-    BTHREAD_TAG_INVALID};
+    BTHREAD_TAG_INVALID, {0}};
 
 static const size_t BTHREAD_EPOLL_THREAD_NUM = 1;
 static const bthread_t BTHREAD_ATOMIC_INIT = 0;
@@ -147,6 +154,9 @@ static const bthread_t BTHREAD_ATOMIC_INIT = 0;
 // Min/Max number of work pthreads.
 static const int BTHREAD_MIN_CONCURRENCY = 3 + BTHREAD_EPOLL_THREAD_NUM;
 static const int BTHREAD_MAX_CONCURRENCY = 1024;
+// Min/max number of ParkingLot.
+static const int BTHREAD_MIN_PARKINGLOT = 4;
+static const int BTHREAD_MAX_PARKINGLOT = 1024;
 
 typedef struct {
     void* impl;
@@ -164,15 +174,38 @@ typedef struct {
     size_t sampling_range;
 } bthread_contention_site_t;
 
-typedef struct {
+struct mutex_owner_t {
+    bool hold;
+    uint64_t id;
+};
+
+typedef struct bthread_mutex_t {
+#if defined(__cplusplus)
+    bthread_mutex_t()
+        : butex(NULL), csite{}
+        , enable_csite(false)
+        , owner{false, 0} {}
+
+    DISALLOW_COPY_AND_ASSIGN(bthread_mutex_t);
+#endif
     unsigned* butex;
     bthread_contention_site_t csite;
+    bool enable_csite;
+    // Note: Owner detection of the mutex comes with average execution
+    // slowdown of about 50%, so it is only used for debugging and is
+    // only available when the macro `BRPC_DEBUG_LOCK' = 1.
+    mutex_owner_t owner;
 } bthread_mutex_t;
 
 typedef struct {
+    bool enable_csite;
 } bthread_mutexattr_t;
 
-typedef struct {
+typedef struct bthread_cond_t {
+#if defined(__cplusplus)
+    bthread_cond_t() : m(NULL), seq(NULL) {}
+    DISALLOW_COPY_AND_ASSIGN(bthread_cond_t);
+#endif
     bthread_mutex_t* m;
     int* seq;
 } bthread_cond_t;
@@ -180,7 +213,28 @@ typedef struct {
 typedef struct {
 } bthread_condattr_t;
 
-typedef struct {
+typedef struct bthread_sem_t {
+#if defined(__cplusplus)
+    bthread_sem_t() : butex(NULL), enable_csite(true) {}
+    DISALLOW_COPY_AND_ASSIGN(bthread_sem_t);
+#endif
+    unsigned* butex;
+    bool enable_csite;
+} bthread_sem_t;
+
+typedef struct bthread_rwlock_t {
+#if defined(__cplusplus)
+    bthread_rwlock_t()
+        : reader_count(0), reader_wait(0), wlock_flag(false), writer_csite{} {}
+    DISALLOW_COPY_AND_ASSIGN(bthread_rwlock_t);
+#endif
+    bthread_sem_t reader_sema; // Semaphore for readers to wait for completing writers.
+    bthread_sem_t writer_sema; // Semaphore for writers to wait for completing readers.
+    int reader_count; // Number of pending readers.
+    int reader_wait; // Number of departing readers.
+    bool wlock_flag; // Flag used to indicate that a write lock has been held.
+    bthread_mutex_t write_queue_mutex; // Held if there are pending writers.
+    bthread_contention_site_t writer_csite;
 } bthread_rwlock_t;
 
 typedef struct {
@@ -208,8 +262,10 @@ friend int bthread::bthread_once_impl(bthread_once_t* once_control, void (*init_
         INITIALIZED,
     };
 
+
     bthread_once_t();
     ~bthread_once_t();
+    DISALLOW_COPY_AND_ASSIGN(bthread_once_t);
 
 private:
     butil::atomic<int>* _butex;

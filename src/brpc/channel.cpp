@@ -37,11 +37,20 @@
 #include "brpc/details/usercode_backup_pool.h"       // TooManyUserCode
 #include "brpc/rdma/rdma_helper.h"
 #include "brpc/policy/esp_authenticator.h"
+#include "brpc/transport_factory.h"
+#include "brpc/details/controller_private_accessor.h"
 
 namespace brpc {
 
 DECLARE_bool(enable_rpcz);
 DECLARE_bool(usercode_in_pthread);
+DEFINE_string(health_check_path, "", "Http path of health check call."
+    "By default health check succeeds if the server is connectable."
+    "If this flag is set, health check is not completed until a http "
+    "call to the path succeeds within -health_check_timeout_ms(to make "
+    "sure the server functions well).");
+DEFINE_int32(health_check_timeout_ms, 500, "The timeout for both establishing "
+    "the connection and the http call to -health_check_path over the connection");
 
 ChannelOptions::ChannelOptions()
     : connect_timeout_ms(200)
@@ -53,8 +62,9 @@ ChannelOptions::ChannelOptions()
     , connection_type(CONNECTION_TYPE_UNKNOWN)
     , succeed_without_server(true)
     , log_succeed_without_server(true)
-    , use_rdma(false)
+    , socket_mode(SOCKET_MODE_TCP)
     , auth(NULL)
+    , backup_request_policy(NULL)
     , retry_policy(NULL)
     , ns_filter(NULL)
 {}
@@ -69,7 +79,10 @@ ChannelSSLOptions* ChannelOptions::mutable_ssl_options() {
 static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
     if (opt.auth == NULL &&
         !opt.has_ssl_options() &&
-        opt.connection_group.empty()) {
+        opt.client_host.empty() &&
+        opt.device_name.empty() &&
+        opt.connection_group.empty() &&
+        opt.hc_option.health_check_path.empty()) {
         // Returning zeroized result by default is more intuitive for users.
         return ChannelSignature();
     }
@@ -85,9 +98,23 @@ static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
             buf.append("|conng=");
             buf.append(opt.connection_group);
         }
+        if (!opt.client_host.empty()) {
+            buf.append("|clih=");
+            buf.append(opt.client_host);
+        }
+        if (!opt.device_name.empty()) {
+            buf.append("|devn=");
+            buf.append(opt.device_name);
+        }
         if (opt.auth) {
             buf.append("|auth=");
             buf.append((char*)&opt.auth, sizeof(opt.auth));
+        }
+        if (!opt.hc_option.health_check_path.empty()) {
+            buf.append("|health_check_path=");
+            buf.append(opt.hc_option.health_check_path);
+            buf.append("|health_check_timeout_ms=");
+            buf.append(std::to_string(opt.hc_option.health_check_timeout_ms));
         }
         if (opt.has_ssl_options()) {
             const ChannelSSLOptions& ssl = opt.ssl_options();
@@ -105,7 +132,7 @@ static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
         } else {
             // All disabled ChannelSSLOptions are the same
         }
-        if (opt.use_rdma) {
+        if (opt.socket_mode == SOCKET_MODE_RDMA) {
             buf.append("|rdma");
         }
         butil::MurmurHash3_x64_128_Update(&mm_ctx, buf.data(), buf.size());
@@ -148,20 +175,6 @@ Channel::~Channel() {
     }
 }
 
-#if BRPC_WITH_RDMA
-static bool OptionsAvailableForRdma(const ChannelOptions* opt) {
-    if (opt->has_ssl_options()) {
-        LOG(WARNING) << "Cannot use SSL and RDMA at the same time";
-        return false;
-    }
-    if (!rdma::SupportedByRdma(opt->protocol.name())) {
-        LOG(WARNING) << "Cannot use " << opt->protocol.name()
-                     << " over RDMA";
-        return false;
-    }
-    return true;
-}
-#endif
 
 int Channel::InitChannelOptions(const ChannelOptions* options) {
     if (options) {  // Override default options if user provided one.
@@ -172,17 +185,14 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
         LOG(ERROR) << "Channel does not support the protocol";
         return -1;
     }
-
-    if (_options.use_rdma) {
-#if BRPC_WITH_RDMA
-        if (!OptionsAvailableForRdma(&_options)) {
-            return -1;
-        }
-        rdma::GlobalRdmaInitializeOrDie();
-#else
-        LOG(WARNING) << "Cannot use rdma since brpc does not compile with rdma";
+    if (_options.hc_option.health_check_path.empty()) {
+        _options.hc_option.health_check_path = FLAGS_health_check_path;
+        _options.hc_option.health_check_timeout_ms = FLAGS_health_check_timeout_ms;
+    }
+    auto ret = TransportFactory::ContextInitOrDie(_options.socket_mode, false, &_options);
+    if (ret != 0) {
+        LOG(ERROR) << "Fail to initialize transport context for channel, ret=" << ret;
         return -1;
-#endif
     }
 
     _serialize_request = protocol->serialize_request;
@@ -233,6 +243,7 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
     if (!cg.empty() && (::isspace(cg.front()) || ::isspace(cg.back()))) {
         butil::TrimWhitespace(cg, butil::TRIM_ALL, &cg);
     }
+
     return 0;
 }
 
@@ -341,14 +352,27 @@ int Channel::InitSingle(const butil::EndPoint& server_addr_and_port,
         LOG(ERROR) << "Invalid port=" << port;
         return -1;
     }
+    butil::EndPoint client_endpoint;
+    if (!_options.client_host.empty() &&
+        butil::str2ip(_options.client_host.c_str(), &client_endpoint.ip) != 0 &&
+        butil::hostname2ip(_options.client_host.c_str(), &client_endpoint.ip) != 0) {
+        LOG(ERROR) << "Invalid client host=`" << _options.client_host << '\'';
+        return -1;
+    }
     _server_address = server_addr_and_port;
     const ChannelSignature sig = ComputeChannelSignature(_options);
     std::shared_ptr<SocketSSLContext> ssl_ctx;
     if (CreateSocketSSLContext(_options, &ssl_ctx) != 0) {
         return -1;
     }
+    SocketOptions opt;
+    opt.local_side = client_endpoint;
+    opt.initial_ssl_ctx = ssl_ctx;
+    opt.socket_mode = _options.socket_mode;
+    opt.hc_option = _options.hc_option;
+    opt.device_name = _options.device_name;
     if (SocketMapInsert(SocketMapKey(server_addr_and_port, sig),
-                        &_server_id, ssl_ctx, _options.use_rdma) != 0) {
+                        &_server_id, opt) != 0) {
         LOG(ERROR) << "Fail to insert into SocketMap";
         return -1;
     }
@@ -376,6 +400,13 @@ int Channel::Init(const char* ns_url,
             _options.mutable_ssl_options()->sni_name = _service_name;
         }
     }
+    butil::EndPoint client_endpoint;
+    if (!_options.client_host.empty() &&
+        butil::str2ip(_options.client_host.c_str(), &client_endpoint.ip) != 0 &&
+        butil::hostname2ip(_options.client_host.c_str(), &client_endpoint.ip) != 0) {
+        LOG(ERROR) << "Invalid client host=`" << _options.client_host << '\'';
+        return -1;
+    }
     std::unique_ptr<LoadBalancerWithNaming> lb(new (std::nothrow)
                                                    LoadBalancerWithNaming);
     if (NULL == lb) {
@@ -385,9 +416,13 @@ int Channel::Init(const char* ns_url,
     GetNamingServiceThreadOptions ns_opt;
     ns_opt.succeed_without_server = _options.succeed_without_server;
     ns_opt.log_succeed_without_server = _options.log_succeed_without_server;
-    ns_opt.use_rdma = _options.use_rdma;
+    ns_opt.socket_option.socket_mode = _options.socket_mode;
     ns_opt.channel_signature = ComputeChannelSignature(_options);
-    if (CreateSocketSSLContext(_options, &ns_opt.ssl_ctx) != 0) {
+    ns_opt.socket_option.hc_option =  _options.hc_option;
+    ns_opt.socket_option.local_side = client_endpoint;
+    ns_opt.socket_option.device_name = _options.device_name;
+    if (CreateSocketSSLContext(_options,
+                               &ns_opt.socket_option.initial_ssl_ctx) != 0) {
         return -1;
     }
     if (lb->Init(ns_url, lb_name, _options.ns_filter, &ns_opt) != 0) {
@@ -468,24 +503,27 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     }
     cntl->set_used_by_rpc();
 
-    if (cntl->_sender == NULL && IsTraceable(Span::tls_parent())) {
+    if (cntl->_sender == NULL && IsTraceable(Span::tls_parent().get())) {
         const int64_t start_send_us = butil::cpuwide_time_us();
-        const std::string* method_name = NULL;
+        std::string method_name;
         if (_get_method_name) {
-            method_name = &_get_method_name(method, cntl);
+            method_name = butil::EnsureString(_get_method_name(method, cntl));
         } else if (method) {
-            method_name = &method->full_name();
+            method_name = butil::EnsureString(method->full_name());
         } else {
             const static std::string NULL_METHOD_STR = "null-method";
-            method_name = &NULL_METHOD_STR;
+            method_name = NULL_METHOD_STR;
         }
-        Span* span = Span::CreateClientSpan(
-            *method_name, start_send_real_us - start_send_us);
-        span->set_log_id(cntl->log_id());
-        span->set_base_cid(correlation_id);
-        span->set_protocol(_options.protocol);
-        span->set_start_send_us(start_send_us);
-        cntl->_span = span;
+        std::shared_ptr<Span> span = Span::CreateClientSpan(
+            method_name, start_send_real_us - start_send_us);
+        if (span) {
+            ControllerPrivateAccessor accessor(cntl);
+            span->set_log_id(cntl->log_id());
+            span->set_base_cid(correlation_id);
+            span->set_protocol(_options.protocol);
+            span->set_start_send_us(start_send_us);
+            accessor.set_span(span);
+        }
     }
     // Override some options if they haven't been set by Controller
     if (cntl->timeout_ms() == UNSET_MAGIC_NUM) {
@@ -495,8 +533,10 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     // overriding connect_timeout_ms does not make sense, just use the
     // one in ChannelOptions
     cntl->_connect_timeout_ms = _options.connect_timeout_ms;
-    if (cntl->backup_request_ms() == UNSET_MAGIC_NUM) {
+    if (cntl->backup_request_ms() == UNSET_MAGIC_NUM &&
+        NULL == cntl->_backup_request_policy) {
         cntl->set_backup_request_ms(_options.backup_request_ms);
+        cntl->_backup_request_policy = _options.backup_request_policy;
     }
     if (cntl->connection_type() == CONNECTION_TYPE_UNKNOWN) {
         cntl->set_connection_type(_options.connection_type);
@@ -532,10 +572,11 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         return cntl->HandleSendFailed();
     }
 
-    if (cntl->_request_stream != INVALID_STREAM_ID) {
+    if (!cntl->_request_streams.empty()) {
         // Currently we cannot handle retry and backup request correctly
         cntl->set_max_retry(0);
         cntl->set_backup_request_ms(-1);
+        cntl->_backup_request_policy = NULL;
     }
 
     if (cntl->backup_request_ms() >= 0 &&
@@ -583,9 +624,7 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         // be woken up by callback when RPC finishes (succeeds or still
         // fails after retry)
         Join(correlation_id);
-        if (cntl->_span) {
-            cntl->SubmitSpan();
-        }
+        cntl->SubmitSpan();
         cntl->OnRPCEnd(butil::gettimeofday_us());
     }
 }

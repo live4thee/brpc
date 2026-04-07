@@ -19,6 +19,7 @@
 #ifndef  BRPC_STREAM_IMPL_H
 #define  BRPC_STREAM_IMPL_H
 
+#include <mutex>
 #include "bthread/bthread.h"
 #include "bthread/execution_queue.h"
 #include "brpc/socket.h"
@@ -46,7 +47,7 @@ public:
                         const StreamWriteOptions* options = NULL);
     static int Create(const StreamOptions& options,
                       const StreamSettings *remote_settings,
-                      StreamId *id);
+                      StreamId *id, bool parse_rpc_response = true);
     StreamId id() { return _id; }
 
     int OnReceived(const StreamFrameMeta& fm, butil::IOBuf *buf, Socket* sock);
@@ -63,6 +64,8 @@ public:
     void FillSettings(StreamSettings *settings);
     static int SetFailed(StreamId id, int error_code, const char* reason_fmt, ...)
         __attribute__ ((__format__ (__printf__, 3, 4)));
+    static int SetFailed(const StreamIds& ids, int error_code, const char* reason_fmt, ...)
+    __attribute__ ((__format__ (__printf__, 3, 4)));
     void Close(int error_code, const char* reason_fmt, ...)
         __attribute__ ((__format__ (__printf__, 3, 4)));
 
@@ -78,7 +81,7 @@ friend struct butil::DefaultDeleter<Stream>;
     void TriggerOnConnectIfNeed();
     void Wait(void (*on_writable)(StreamId, void*, int), void* arg, 
               const timespec* due_time, bool new_thread, bthread_id_t *join_id);
-    void SendFeedback();
+    void SendFeedback(int64_t _consumed_bytes);
     void StartIdleTimer();
     void StopIdleTimer();
     void HandleRpcResponse(butil::IOBuf* response_buffer);
@@ -112,7 +115,7 @@ friend struct butil::DefaultDeleter<Stream>;
 
     bthread_mutex_t     _connect_mutex;
     ConnectMeta         _connect_meta;
-    bool                _connected;
+    butil::atomic<bool> _connected;
     bool                _closed;
     int                 _error_code;
     std::string         _error_text;
@@ -124,13 +127,15 @@ friend struct butil::DefaultDeleter<Stream>;
     bthread_id_list_t _writable_wait_list;
 
     int64_t _local_consumed;
-    StreamSettings _remote_settings;   
+    butil::atomic<int64_t> _atomic_local_consumed;
+    StreamSettings _remote_settings;
 
     bool _parse_rpc_response;
     bthread::ExecutionQueueId<butil::IOBuf*> _consumer_queue;
     butil::IOBuf *_pending_buf;
     int64_t _start_idle_timer_us;
     bthread_timer_t _idle_timer;
+    std::once_flag _set_host_socket_flag;
 };
 
 } // namespace brpc

@@ -67,16 +67,6 @@ if((NOT GFLAGS_INCLUDE_PATH) OR (NOT GFLAGS_LIBRARY))
 endif()
 include_directories(${GFLAGS_INCLUDE_PATH})
 
-execute_process(
-    COMMAND bash -c "grep \"namespace [_A-Za-z0-9]\\+ {\" ${GFLAGS_INCLUDE_PATH}/gflags/gflags_declare.h | head -1 | awk '{print $2}' | tr -d '\n'"
-    OUTPUT_VARIABLE GFLAGS_NS
-)
-if(${GFLAGS_NS} STREQUAL "GFLAGS_NAMESPACE")
-    execute_process(
-        COMMAND bash -c "grep \"#define GFLAGS_NAMESPACE [_A-Za-z0-9]\\+\" ${GFLAGS_INCLUDE_PATH}/gflags/gflags_declare.h | head -1 | awk '{print $3}' | tr -d '\n'"
-        OUTPUT_VARIABLE GFLAGS_NS
-    )
-endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     include(CheckFunctionExists)
     CHECK_FUNCTION_EXISTS(clock_gettime HAVE_CLOCK_GETTIME)
@@ -85,8 +75,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     endif()
 endif()
 
-set(CMAKE_CPP_FLAGS "${DEFINE_CLOCK_GETTIME} -DGFLAGS_NS=${GFLAGS_NS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS} -DNDEBUG -O2 -D__const__=__unused__ -pipe -W -Wall -Wno-unused-parameter -fPIC -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${DEFINE_CLOCK_GETTIME} -DNDEBUG -O2 -D__const__=__unused__ -pipe -W -Wall -Wno-unused-parameter -fPIC -fno-omit-frame-pointer")
 
 if(CMAKE_VERSION VERSION_LESS "3.1.3")
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -140,15 +129,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         "-Wl,-U,_MallocExtension_ReleaseFreeMemory"
         "-Wl,-U,_ProfilerStart"
         "-Wl,-U,_ProfilerStop"
-        "-Wl,-U,__Z13GetStackTracePPvii")
+        "-Wl,-U,__Z13GetStackTracePPvii"
+        "-Wl,-U,_mallctl"
+        "-Wl,-U,_malloc_stats_print"
+    )
 endif()
 
 add_executable(redis_cli redis_cli.cpp)
 add_executable(redis_press redis_press.cpp)
 add_executable(redis_server redis_server.cpp)
+add_executable(redis_cluster_client redis_cluster_client.cpp)
 
 set(AUX_LIB readline ncurses)
 
 target_link_libraries(redis_cli ${BRPC_LIB} ${DYNAMIC_LIB} ${AUX_LIB})
 target_link_libraries(redis_press ${BRPC_LIB} ${DYNAMIC_LIB})
 target_link_libraries(redis_server ${BRPC_LIB} ${DYNAMIC_LIB})
+target_link_libraries(redis_cluster_client ${BRPC_LIB} ${DYNAMIC_LIB})
